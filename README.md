@@ -1,6 +1,6 @@
 # Solana Wallet Intel
 
-Real-time Solana wallet intelligence platform. Ingests blockchain events via Helius webhooks, normalizes transactions, tracks wallet positions, computes metrics, and predicts pump activity.
+Open-source real-time Solana wallet intelligence infrastructure. Ingests blockchain events via Helius webhooks, normalizes transactions, tracks wallet positions, computes metrics, and performs signal ranking experiments for market intelligence research.
 
 ## Architecture
 
@@ -105,6 +105,8 @@ docker compose exec api alembic upgrade head
 ## Safety Notice
 
 This repository is a sanitized public version. Production secrets, API keys, deployment scripts, and private infrastructure configuration are intentionally excluded. See [SECURITY.md](SECURITY.md) for details.
+
+This project is research infrastructure for blockchain data engineering and wallet behavior analytics. It is not a trading bot and does not guarantee any financial returns. The paper-trading simulation is for evaluation purposes only.
 
 ## License
 

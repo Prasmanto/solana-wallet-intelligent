@@ -13,7 +13,7 @@ See [SECURITY.md](../SECURITY.md) for details on what is excluded and why.
 - `publish_events.py` — Publish test events to Redis Streams
 - `simulate_pipeline.py` — Run full pipeline simulation
 - `liquidity_burst_simulator.py` — Simulate liquidity burst scenarios
-- `run_pump_scenarios.py` — Run pump prediction test scenarios
+- `run_pump_scenarios.py` — Run market intelligence test scenarios
 
 ### Intelligence & Analytics
 - `inspect_streams.py` — Inspect Redis Streams contents
