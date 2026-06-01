@@ -1,0 +1,16 @@
+{
+  "direction": "buy",
+  "fee_sol": "0.000005",
+  "protocol": "unknown",
+  "token_in": {
+    "amount": "500.0",
+    "decimals": 9,
+    "mint": "UnknownToken999999999999999999999999999999999"
+  },
+  "token_out": {
+    "amount": "100.0",
+    "decimals": 6,
+    "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+  },
+  "wallet": "Wallet99999999999999999999999999999999999999"
+}

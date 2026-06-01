@@ -1,0 +1,1 @@
+"""Jupiter fixtures."""

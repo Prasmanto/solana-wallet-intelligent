@@ -1,0 +1,16 @@
+{
+  "direction": "buy",
+  "fee_sol": "0.000005",
+  "protocol": "jupiter",
+  "token_in": {
+    "amount": "225.0",
+    "decimals": 6,
+    "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+  },
+  "token_out": {
+    "amount": "1.5",
+    "decimals": 9,
+    "mint": "So11111111111111111111111111111111111111112"
+  },
+  "wallet": "Wallet11111111111111111111111111111111111111"
+}

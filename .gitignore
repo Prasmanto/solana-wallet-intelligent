@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Docker
+docker-compose.override.yml
+
+# Database
+*.db
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Secrets
+config/api_keys.json
+
+# Temporary files
+check_fix.py
+diagnose.py
+test_parse.py
+FULL_INTELLIGENCE_ORCHESTRATION_CHANGES.md
+LIVE_INTELLIGENCE_AUDIT.md
+LIVE_PIPELINE_CHANGES.md

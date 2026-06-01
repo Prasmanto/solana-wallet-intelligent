@@ -1,0 +1,16 @@
+{
+  "direction": "sell",
+  "fee_sol": "0.000005",
+  "protocol": "pump.fun",
+  "token_in": {
+    "amount": "0.3",
+    "decimals": 9,
+    "mint": "So11111111111111111111111111111111111111112"
+  },
+  "token_out": {
+    "amount": "2000.0",
+    "decimals": 9,
+    "mint": "MemeCoinMint777777777777777777777777777777777"
+  },
+  "wallet": "Wallet77777777777777777777777777777777777777"
+}

@@ -1,0 +1,16 @@
+{
+  "direction": "buy",
+  "fee_sol": "0.000005",
+  "protocol": "raydium",
+  "token_in": {
+    "amount": "1000000000.0",
+    "decimals": 9,
+    "mint": "SHIBTokenAAAA111111111111111111111111111111"
+  },
+  "token_out": {
+    "amount": "1000.0",
+    "decimals": 6,
+    "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+  },
+  "wallet": "WalletAAAA111111111111111111111111111111111"
+}

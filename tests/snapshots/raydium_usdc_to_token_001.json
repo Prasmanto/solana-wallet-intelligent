@@ -1,0 +1,16 @@
+{
+  "direction": "buy",
+  "fee_sol": "0.000005",
+  "protocol": "raydium",
+  "token_in": {
+    "amount": "250.0",
+    "decimals": 9,
+    "mint": "TokenMint44444444444444444444444444444444444"
+  },
+  "token_out": {
+    "amount": "50.0",
+    "decimals": 6,
+    "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+  },
+  "wallet": "Wallet44444444444444444444444444444444444444"
+}

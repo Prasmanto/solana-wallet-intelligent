@@ -1,0 +1,16 @@
+{
+  "direction": "buy",
+  "fee_sol": "0.000005",
+  "protocol": "unknown",
+  "token_in": {
+    "amount": "5.0",
+    "decimals": 9,
+    "mint": "So11111111111111111111111111111111111111112"
+  },
+  "token_out": {
+    "amount": "5.0",
+    "decimals": 9,
+    "mint": "So11111111111111111111111111111111111111112"
+  },
+  "wallet": "WalletBBBB111111111111111111111111111111111"
+}
