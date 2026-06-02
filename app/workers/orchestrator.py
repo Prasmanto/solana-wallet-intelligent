@@ -110,10 +110,16 @@ class WorkerOrchestrator:
         from app.workers.paper_trading_worker import PaperTradingWorker
         from app.workers.pricing_worker import PricingRefreshWorker
         
-        paper_trading_worker = PaperTradingWorker()
+        paper_trading_worker = PaperTradingWorker(session_factory=session_factory)
         self._workers.append(paper_trading_worker)
         task = asyncio.create_task(paper_trading_worker.run())
         self._tasks.append(task)
+
+        # Wire PaperTradingWorker to RankingWorker for direct candidate processing
+        for w in self._workers:
+            if isinstance(w, RankingWorker):
+                w._paper_worker = paper_trading_worker
+                break
         
         pricing_worker = PricingRefreshWorker()
         self._workers.append(pricing_worker)

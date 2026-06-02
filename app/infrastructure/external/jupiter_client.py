@@ -1,17 +1,29 @@
 """Jupiter Price API client.
 
-Provides async integration with Jupiter Price API v2:
-- Batch price fetching
+Provides async integration with Jupiter Price API V3:
+- Batch price fetching (up to 100 tokens per request)
 - Single token price
-- Token metadata
-- Price confidence scoring
+- USD-denominated pricing
+- Graceful fallback on errors
 
 API Reference: https://docs.jup.ag/docs/apis/price-api
+Endpoint: https://lite-api.jup.ag/price/v3
+
+V3 Response Format:
+{
+  "<mint>": {
+    "usdPrice": 0.999,
+    "decimals": 6,
+    "liquidity": 435428804.12,
+    "priceChange24h": 0.005,
+    "blockId": 423684146,
+    "createdAt": "2024-06-05T08:55:25.527Z"
+  }
+}
 """
 
 from __future__ import annotations
 
-import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -19,16 +31,10 @@ from typing import Any
 import httpx
 import structlog
 
+from app.config.settings import settings
 from app.schemas.pricing import TokenPrice
 
 logger = structlog.get_logger(__name__)
-
-# Jupiter Price API v2
-JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
-JUPITER_TOKEN_API = "https://tokens.jup.ag/token"
-
-# Batch size limit for Jupiter API
-MAX_BATCH_SIZE = 100
 
 # Known stablecoins for pricing
 STABLECOINS = {
@@ -39,13 +45,21 @@ STABLECOINS = {
 # SOL mint
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
+# Batch size limit
+MAX_BATCH_SIZE = 100
+
 
 class JupiterPriceClient:
-    """Async client for Jupiter Price API."""
+    """Async client for Jupiter Price API V3."""
 
     def __init__(self, timeout: float = 10.0) -> None:
         self._timeout = timeout
         self._client: httpx.AsyncClient | None = None
+
+    @property
+    def _base_url(self) -> str:
+        """Get base URL from settings (configurable)."""
+        return settings.JUPITER_PRICE_BASE_URL
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
@@ -64,59 +78,29 @@ class JupiterPriceClient:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
-    async def get_price(
-        self,
-        mint: str,
-        vs_token: str = SOL_MINT,
-    ) -> TokenPrice | None:
-        """Get price for a single token.
+    async def get_price(self, mint: str) -> TokenPrice | None:
+        """Get USD price for a single token.
 
         Args:
             mint: Token mint address
-            vs_token: Quote token (default: SOL)
 
         Returns:
-            TokenPrice or None if not found
+            TokenPrice or None if not found/illiquid/error
         """
-        try:
-            client = await self._get_client()
-            response = await client.get(
-                JUPITER_PRICE_API,
-                params={
-                    "ids": mint,
-                    "vsToken": vs_token,
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            if mint not in data.get("data", {}):
-                return None
-
-            token_data = data["data"][mint]
-            return self._parse_price(mint, token_data)
-
-        except Exception as e:
-            logger.error(
-                "jupiter.price_fetch_error",
-                mint=mint[:16],
-                error=str(e),
-            )
-            return None
+        results = await self.get_batch_prices([mint])
+        return results.get(mint)
 
     async def get_batch_prices(
         self,
         mints: list[str],
-        vs_token: str = SOL_MINT,
     ) -> dict[str, TokenPrice]:
-        """Get prices for multiple tokens in batch.
+        """Get USD prices for multiple tokens in batch.
 
         Args:
             mints: List of token mint addresses
-            vs_token: Quote token (default: SOL)
 
         Returns:
-            Dict of mint -> TokenPrice
+            Dict of mint -> TokenPrice (only for tokens with valid prices)
         """
         if not mints:
             return {}
@@ -125,18 +109,14 @@ class JupiterPriceClient:
 
         # Process in batches
         for i in range(0, len(mints), MAX_BATCH_SIZE):
-            batch = mints[i:i + MAX_BATCH_SIZE]
-            batch_results = await self._fetch_batch(batch, vs_token)
+            batch = mints[i : i + MAX_BATCH_SIZE]
+            batch_results = await self._fetch_batch(batch)
             results.update(batch_results)
 
         return results
 
-    async def _fetch_batch(
-        self,
-        mints: list[str],
-        vs_token: str,
-    ) -> dict[str, TokenPrice]:
-        """Fetch a batch of prices."""
+    async def _fetch_batch(self, mints: list[str]) -> dict[str, TokenPrice]:
+        """Fetch a batch of prices from Jupiter V3."""
         results: dict[str, TokenPrice] = {}
 
         try:
@@ -144,81 +124,117 @@ class JupiterPriceClient:
             ids_param = ",".join(mints)
 
             response = await client.get(
-                JUPITER_PRICE_API,
-                params={
-                    "ids": ids_param,
-                    "vsToken": vs_token,
-                },
+                self._base_url,
+                params={"ids": ids_param},
             )
             response.raise_for_status()
             data = response.json()
 
-            for mint in mints:
-                if mint in data.get("data", {}):
-                    token_data = data["data"][mint]
-                    price = self._parse_price(mint, token_data)
-                    if price:
-                        results[mint] = price
+            if not isinstance(data, dict):
+                logger.warning("jupiter.v3unexpected_response", type=type(data).__name__)
+                return results
 
-        except Exception as e:
-            logger.error(
-                "jupiter.batch_fetch_error",
+            for mint in mints:
+                if mint not in data:
+                    continue
+                token_data = data[mint]
+                if not isinstance(token_data, dict):
+                    continue
+                price = self._parse_price(mint, token_data)
+                if price:
+                    results[mint] = price
+
+        except httpx.TimeoutException:
+            logger.warning(
+                "jupiter.timeout",
                 batch_size=len(mints),
-                error=str(e),
+                url=self._base_url,
+            )
+        except httpx.HTTPStatusError as e:
+            logger.warning(
+                "jupiter.http_error",
+                status=e.response.status_code,
+                batch_size=len(mints),
+            )
+        except Exception as e:
+            logger.warning(
+                "jupiter.fetch_error",
+                batch_size=len(mints),
+                error=str(e)[:200],
             )
 
         return results
 
-    def _parse_price(
-        self,
-        mint: str,
-        data: dict[str, Any],
-    ) -> TokenPrice | None:
-        """Parse Jupiter price response into TokenPrice."""
+    def _parse_price(self, mint: str, data: dict[str, Any]) -> TokenPrice | None:
+        """Parse Jupiter V3 price response into TokenPrice.
+
+        V3 format:
+        {
+            "usdPrice": 0.999,
+            "decimals": 6,
+            "liquidity": 435428804.12,
+            "priceChange24h": 0.005,
+            "blockId": 423684146,
+            "createdAt": "2024-06-05T08:55:25.527Z"
+        }
+        """
         try:
-            price = Decimal(str(data.get("price", 0)))
+            usd_price = data.get("usdPrice")
+            if usd_price is None:
+                return None
+
+            price = Decimal(str(usd_price))
             if price <= 0:
                 return None
 
-            # Get token info if available
-            token_info = data.get("token_info", {})
-            decimals = token_info.get("decimals", 9)
+            decimals = data.get("decimals", 9)
+            if not isinstance(decimals, int):
+                decimals = 9
 
-            # Calculate confidence based on price staleness
-            confidence = Decimal("1.0")
+            # Get symbol/name from stablecoins map if available
+            symbol = ""
+            name = ""
+            if mint in STABLECOINS:
+                symbol, _ = STABLECOINS[mint]
 
             return TokenPrice(
                 mint=mint,
                 price=price,
-                symbol=token_info.get("symbol", ""),
-                name=token_info.get("name", ""),
+                symbol=symbol,
+                name=name,
                 decimals=decimals,
-                confidence=confidence,
-                source="jupiter",
+                confidence=Decimal("1.0"),
+                source="jupiter_v3",
                 fetched_at=datetime.now(timezone.utc),
             )
         except Exception as e:
-            logger.error(
+            logger.warning(
                 "jupiter.parse_error",
                 mint=mint[:16],
-                error=str(e),
+                error=str(e)[:100],
             )
             return None
 
-    async def get_token_metadata(
-        self,
-        mint: str,
-    ) -> dict[str, Any] | None:
-        """Get token metadata from Jupiter."""
+    async def get_token_metadata(self, mint: str) -> dict[str, Any] | None:
+        """Get token metadata — not available in V3 price API.
+
+        Returns basic info from V3 response if available.
+        """
         try:
             client = await self._get_client()
-            response = await client.get(f"{JUPITER_TOKEN_API}/{mint}")
+            response = await client.get(
+                self._base_url,
+                params={"ids": mint},
+            )
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+
+            if mint in data and isinstance(data[mint], dict):
+                return data[mint]
         except Exception as e:
-            logger.error(
+            logger.warning(
                 "jupiter.metadata_error",
                 mint=mint[:16],
-                error=str(e),
+                error=str(e)[:100],
             )
-            return None
+        return None

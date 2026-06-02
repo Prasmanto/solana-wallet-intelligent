@@ -85,12 +85,31 @@ class AnalyticsWorker(ConsumerWorker):
 
         # 5. Publish aggregated features to AGGREGATED_FEATURES
         token = payload.get("token", "")
-        if token:
+        wallet = payload.get("wallet", "")
+        if token and wallet:
+            # Compute features directly from payload and intelligence
+            features = intelligence.get("features", {})
+            
+            # If features from PersistentFeatureStore are empty, compute from payload
+            if not features or all(v == 0 for v in features.values() if isinstance(v, (int, float))):
+                direction = payload.get("direction", "UNKNOWN")
+                amount = payload.get("amount", 0) or payload.get("amount_out", 0) or 0
+                features = {
+                    "volume": amount if amount else 0,
+                    "tx_frequency": 1,
+                    "token_diversity": 1,
+                    "buy_count": 1 if direction == "BUY" else 0,
+                    "sell_count": 1 if direction == "SELL" else 0,
+                    "transfer_count": 1 if direction not in ("BUY", "SELL") else 0,
+                    "buy_sell_ratio": 1.0 if direction == "BUY" else 0.0 if direction == "SELL" else 0.5,
+                    "interaction_score": min(1.0, amount / 1000) if amount else 0.1,
+                }
+
             aggregated_features = {
                 "token": token,
-                "wallet": payload.get("wallet", ""),
+                "wallet": wallet,
                 "cluster_id": intelligence.get("cluster_id", ""),
-                "features": intelligence.get("features", {}),
+                "features": features,
                 "smart_money": intelligence.get("smart_money"),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }

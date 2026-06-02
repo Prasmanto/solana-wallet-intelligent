@@ -56,20 +56,55 @@ class MetricsAggregator:
         # Compute aggregated metrics
         metrics = self._aggregate_positions(wallet, positions)
 
+        # Clamp Numeric(20,9) overflow — max absolute value is 10^11 - 1
+        _MAX_NUMERIC = 99_999_999_999.999999999
+        _MIN_NUMERIC = -99_999_999_999.999999999
+        _MAX_SMALL = 999_999.9999
+        _MIN_SMALL = -999_999.9999
+
+        import math
+
+        def _safe_float(v, small: bool = False) -> float:
+            """Convert Decimal/int/float to safe float, clamped to Numeric range.
+
+            small=True clamps to Numeric(10,4) range (for roi, win_rate).
+            """
+            lo = _MIN_SMALL if small else _MIN_NUMERIC
+            hi = _MAX_SMALL if small else _MAX_NUMERIC
+            try:
+                f = float(v)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+            if math.isnan(f) or math.isinf(f):
+                logger.warning(
+                    "metrics.clamped_extreme",
+                    wallet=wallet[:8],
+                    value=str(v)[:50],
+                )
+                return 0.0
+            if f > hi or f < lo:
+                logger.warning(
+                    "metrics.clamped_overflow",
+                    wallet=wallet[:8],
+                    original=f,
+                )
+                return max(lo, min(hi, f))
+            return f
+
         # Persist metrics
         await self._repo.upsert_metrics(
             wallet=wallet,
-            total_realized_pnl=float(metrics.total_realized_pnl),
-            total_realized_roi=float(metrics.total_realized_roi),
-            total_fees_paid=float(metrics.total_fees_paid),
-            net_pnl=float(metrics.net_pnl),
+            total_realized_pnl=_safe_float(metrics.total_realized_pnl),
+            total_realized_roi=_safe_float(metrics.total_realized_roi, small=True),
+            total_fees_paid=_safe_float(metrics.total_fees_paid),
+            net_pnl=_safe_float(metrics.net_pnl),
             total_wins=metrics.total_wins,
             total_losses=metrics.total_losses,
-            win_rate=float(metrics.win_rate),
-            avg_win_pnl=float(metrics.avg_win_pnl),
-            avg_loss_pnl=float(metrics.avg_loss_pnl),
-            best_trade_pnl=float(metrics.best_trade_pnl),
-            worst_trade_pnl=float(metrics.worst_trade_pnl),
+            win_rate=_safe_float(metrics.win_rate, small=True),
+            avg_win_pnl=_safe_float(metrics.avg_win_pnl),
+            avg_loss_pnl=_safe_float(metrics.avg_loss_pnl),
+            best_trade_pnl=_safe_float(metrics.best_trade_pnl),
+            worst_trade_pnl=_safe_float(metrics.worst_trade_pnl),
             best_trade_token=metrics.best_trade_token,
             worst_trade_token=metrics.worst_trade_token,
             total_unique_tokens=metrics.total_unique_tokens,
@@ -77,12 +112,12 @@ class MetricsAggregator:
             total_trades=metrics.total_trades,
             total_buys=metrics.total_buys,
             total_sells=metrics.total_sells,
-            total_buy_volume=float(metrics.total_buy_volume),
-            total_sell_volume=float(metrics.total_sell_volume),
-            total_volume=float(metrics.total_volume),
+            total_buy_volume=_safe_float(metrics.total_buy_volume),
+            total_sell_volume=_safe_float(metrics.total_sell_volume),
+            total_volume=_safe_float(metrics.total_volume),
             avg_hold_duration_seconds=metrics.avg_hold_duration_seconds,
-            avg_position_size=float(metrics.avg_position_size),
-            max_position_size=float(metrics.max_position_size),
+            avg_position_size=_safe_float(metrics.avg_position_size),
+            max_position_size=_safe_float(metrics.max_position_size),
             first_trade_at=metrics.first_trade_at,
             last_trade_at=metrics.last_trade_at,
             metrics_version=metrics.metrics_version,
@@ -116,31 +151,65 @@ class MetricsAggregator:
         wallet: str,
         positions: list[WalletPosition],
     ) -> WalletMetrics:
-        """Compute aggregated metrics from positions."""
+        """Compute aggregated metrics from positions.
+
+        All Decimal sums are clamped to safe ranges before arithmetic
+        to prevent Numeric(20,9) overflow from extreme raw token amounts.
+        """
         if not positions:
             return WalletMetrics(wallet=wallet)
 
-        # Collect all realized PnLs for win/loss calculation
-        pnls = [Decimal(str(p.realized_pnl)) for p in positions]
+        # Safe Decimal cap: Numeric(20,9) max is 10^11 - 1
+        _DEC_CAP = Decimal("99999999999")
+        _DEC_NEG_CAP = Decimal("-99999999999")
+
+        def _safe_decimal(v, cap: Decimal = _DEC_CAP) -> Decimal:
+            """Convert to Decimal safely, clamped to prevent overflow."""
+            try:
+                d = Decimal(str(v))
+            except (TypeError, ValueError, InvalidOperation):
+                return Decimal("0")
+            if d.is_nan() or d.is_infinite():
+                return Decimal("0")
+            return max(-cap, min(cap, d))
+
+        def _safe_sum(items: list[Decimal], cap: Decimal = _DEC_CAP) -> Decimal:
+            """Sum Decimal items with per-item clamping and final clamp."""
+            total = Decimal("0")
+            for item in items:
+                clamped = max(-cap, min(cap, item))
+                total += clamped
+                # Clamp running total to prevent overflow
+                total = max(-cap, min(cap, total))
+            return total
+
+        from decimal import InvalidOperation
+
+        # Collect all realized PnLs for win/loss calculation — clamp each value
+        pnls = [_safe_decimal(p.realized_pnl) for p in positions]
         winning_pnls = [p for p in pnls if p > 0]
         losing_pnls = [p for p in pnls if p < 0]
 
-        # Basic sums
-        total_realized_pnl = sum(pnls)
-        total_fees = sum(Decimal(str(p.total_fees_paid)) for p in positions)
+        # Basic sums — safe_sum prevents overflow
+        total_realized_pnl = _safe_sum(pnls)
+        total_fees = _safe_sum([_safe_decimal(p.total_fees_paid) for p in positions])
         total_buys = sum(p.total_buys for p in positions)
         total_sells = sum(p.total_sells for p in positions)
-        total_buy_volume = sum(Decimal(str(p.total_buy_volume)) for p in positions)
-        total_sell_volume = sum(Decimal(str(p.total_sell_volume)) for p in positions)
+        total_buy_volume = _safe_sum([_safe_decimal(p.total_buy_volume) for p in positions])
+        total_sell_volume = _safe_sum([_safe_decimal(p.total_sell_volume) for p in positions])
 
         # Win/loss metrics
         total_wins = len(winning_pnls)
         total_losses = len(losing_pnls)
         total_closed = total_wins + total_losses
-        win_rate = Decimal(str(total_wins / total_closed * 100)) if total_closed > 0 else Decimal("0")
+        win_rate = _safe_decimal(total_wins / total_closed * 100, cap=Decimal("100")) if total_closed > 0 else Decimal("0")
 
         avg_win = sum(winning_pnls) / len(winning_pnls) if winning_pnls else Decimal("0")
         avg_loss = sum(losing_pnls) / len(losing_pnls) if losing_pnls else Decimal("0")
+
+        # Clamp avg_win/avg_loss to prevent division artifacts
+        avg_win = max(-_DEC_CAP, min(_DEC_CAP, avg_win))
+        avg_loss = max(-_DEC_CAP, min(_DEC_CAP, avg_loss))
 
         # Best/worst trades
         best_pnl = max(pnls) if pnls else Decimal("0")
@@ -149,16 +218,21 @@ class MetricsAggregator:
         best_token = ""
         worst_token = ""
         for p in positions:
-            if Decimal(str(p.realized_pnl)) == best_pnl:
+            p_pnl = _safe_decimal(p.realized_pnl)
+            if p_pnl == best_pnl:
                 best_token = p.token_mint
-            if Decimal(str(p.realized_pnl)) == worst_pnl:
+            if p_pnl == worst_pnl:
                 worst_token = p.token_mint
 
         # Position metrics
         active_positions = sum(1 for p in positions if p.position_size > 0)
-        position_sizes = [Decimal(str(p.position_size)) for p in positions if p.position_size > 0]
+        position_sizes = [_safe_decimal(p.position_size) for p in positions if p.position_size > 0]
         avg_position = sum(position_sizes) / len(position_sizes) if position_sizes else Decimal("0")
         max_position = max(position_sizes) if position_sizes else Decimal("0")
+
+        # Clamp position sizes
+        avg_position = max(-_DEC_CAP, min(_DEC_CAP, avg_position))
+        max_position = max(-_DEC_CAP, min(_DEC_CAP, max_position))
 
         # Hold duration
         total_hold = sum(p.hold_duration_seconds for p in positions)

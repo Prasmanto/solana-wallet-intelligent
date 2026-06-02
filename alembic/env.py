@@ -15,7 +15,7 @@ from app.infrastructure.database.session import Base
 from app.infrastructure.database.models import RawEvent  # noqa: F401
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL_SYNC)
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

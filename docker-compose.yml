@@ -1,0 +1,133 @@
+# ============================================================
+# Solana Wallet Intel — Local Development Stack
+# ============================================================
+# Usage:
+#   cp .env.example .env
+#   docker compose up -d
+#   docker compose logs -f api
+#
+# Services:
+#   postgres   — Primary data store
+#   redis      — Event streams + cache
+#   api        — FastAPI HTTP server (hot-reload)
+#   worker     — Async event processing pipeline
+# ============================================================
+
+services:
+
+  # ─── PostgreSQL ───────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: solana_intel_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-solana_intel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-solana_wallet_intel}
+    # No host port mapping — PostgreSQL only accessible via Docker internal network
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - solana_intel_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-solana_intel} -d ${POSTGRES_DB:-solana_wallet_intel}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ─── Redis ────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: solana_intel_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 2gb
+      --maxmemory-policy noeviction
+    # No host port mapping — Redis only accessible via Docker internal network
+    volumes:
+      - redis_data:/data
+    networks:
+      - solana_intel_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─── FastAPI API ──────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: production
+    container_name: solana_intel_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SERVICE_ROLE: api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./app:/code/app
+      - ./alembic:/code/alembic
+      - ./config:/root/solana-wallet-intel/config
+    networks:
+      - solana_intel_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ─── Async Worker (event pipeline) ───────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: production
+    container_name: solana_intel_worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SERVICE_ROLE: worker
+    volumes:
+      - ./app:/code/app
+      - ./alembic:/code/alembic
+      - ./config:/root/solana-wallet-intel/config
+    networks:
+      - solana_intel_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import redis; r=redis.Redis(host='${REDIS_HOST:-redis}',port=${REDIS_PORT:-6379}); r.ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+# ─── Named Volumes ──────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# ─── Network ────────────────────────────────────────────────
+networks:
+  solana_intel_net:
+    driver: bridge
+    name: solana_intel_network

@@ -79,7 +79,27 @@ def extract_wallet(payload: dict[str, Any]) -> tuple[str, str, float]:
         if parts and is_valid_solana_address(parts[0]):
             return parts[0], "description", 0.75
 
-    # 3. account_data[0].account fallback
+    # 3. token_transfers[0].fromUserAccount or .toUserAccount
+    tt = payload.get("token_transfers", [])
+    if tt and isinstance(tt, list) and len(tt) > 0:
+        from_user = tt[0].get("fromUserAccount", "")
+        if is_valid_solana_address(from_user):
+            return from_user, "token_transfers.from", 0.70
+        to_user = tt[0].get("toUserAccount", "")
+        if is_valid_solana_address(to_user):
+            return to_user, "token_transfers.to", 0.70
+
+    # 4. native_transfers[0].fromUserAccount or .toUserAccount
+    nt = payload.get("native_transfers", [])
+    if nt and isinstance(nt, list) and len(nt) > 0:
+        from_user = nt[0].get("fromUserAccount", "")
+        if is_valid_solana_address(from_user):
+            return from_user, "native_transfers.from", 0.65
+        to_user = nt[0].get("toUserAccount", "")
+        if is_valid_solana_address(to_user):
+            return to_user, "native_transfers.to", 0.65
+
+    # 5. account_data[0].account fallback
     ad = payload.get("account_data", [])
     if ad and isinstance(ad, list) and len(ad) > 0:
         account = ad[0].get("account", "")
@@ -141,8 +161,24 @@ def extract_tokens(payload: dict[str, Any]) -> tuple[str, str, str, str, float, 
     if not input_token and not output_token:
         tt = payload.get("token_transfers", [])
         if tt and isinstance(tt, list) and len(tt) > 0:
+            # Use the mint from the first transfer
             output_token = tt[0].get("mint", "")
-            amount_out = tt[0].get("amount", 0)
+            raw_amount = tt[0].get("tokenAmount", tt[0].get("amount", 0))
+            try:
+                amount_out = float(raw_amount) if raw_amount else 0.0
+            except (ValueError, TypeError):
+                amount_out = 0.0
+
+    # Fallback to native_transfers
+    if not input_token and not output_token:
+        nt = payload.get("native_transfers", [])
+        if nt and isinstance(nt, list) and len(nt) > 0:
+            output_token = "So11111111111111111111111111111111111111112"
+            raw = nt[0].get("amount", 0)
+            try:
+                amount_out = float(int(raw)) / 1e9 if raw else 0.0
+            except (ValueError, TypeError):
+                amount_out = 0.0
 
     # Determine primary token and direction
     primary_token = output_token or input_token or ""

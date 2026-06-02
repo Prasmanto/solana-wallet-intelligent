@@ -1,42 +1,82 @@
-"""Paper trading worker — automatically manages virtual positions from predictions."""
+"""Paper trading worker — manages virtual positions from ranked candidates.
+
+Pipeline position: RANKINGS → paper_trading
+
+This worker:
+1. Receives ranked candidates from RankingWorker via PAPER_TRADING stream
+2. Evaluates candidates against entry rules
+3. In dry-run mode: records candidates as SKIPPED (visibility only)
+4. In live mode: fetches entry price via PricingService, creates OPEN position
+5. Monitors OPEN positions for TP/SL/timeout exit conditions
+6. Persists positions, outcomes, and snapshots to DB
+
+Safety guarantees:
+- PAPER_TRADING_ENABLED=false: no positions created at all
+- PAPER_TRADING_DRY_RUN=true: candidates logged as SKIPPED, never OPEN
+- Never executes real trades or signs transactions
+- Never uses wallet private keys
+"""
 
 from __future__ import annotations
 
 import asyncio
-import structlog
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from app.paper_trading.position_manager import PositionManager
-from app.paper_trading.trade_simulator import TradeSimulator
-from app.paper_trading.portfolio_manager import PortfolioManager
-from app.paper_trading.outcome_tracker import OutcomeTracker
+import structlog
+from sqlalchemy import func, select, text
+
+from app.config.settings import settings
+from app.infrastructure.database.models.paper_trading import (
+    PaperPortfolioSnapshot,
+    PaperPosition,
+    PaperTradeOutcome,
+)
+from app.infrastructure.database.models.wallet_position import WalletPosition
 
 logger = structlog.get_logger(__name__)
 
+# Exit thresholds
+TAKE_PROFIT_1_PCT = 20.0
+TAKE_PROFIT_2_PCT = 50.0
+STOP_LOSS_PCT = -10.0
+TIMEOUT_HOURS = 24
+
 
 class PaperTradingWorker:
-    """Continuously manages virtual positions from live predictions."""
+    """Manages virtual paper trading positions from ranked candidates."""
 
-    def __init__(self) -> None:
-        self._position_mgr = PositionManager()
-        self._simulator = TradeSimulator(self._position_mgr)
-        self._portfolio = PortfolioManager(self._position_mgr)
-        self._outcomes = OutcomeTracker()
+    def __init__(self, session_factory: Any = None) -> None:
+        self._session_factory = session_factory
+        self._pricing: Any = None
         self._running = False
-        self._price_cache: dict[str, float] = {}
+        self._last_snapshot: datetime | None = None
+        self._cycle_count = 0
+        # Price feed stats
+        self._price_success_count = 0
+        self._price_failure_count = 0
+        self._price_unavailable_tokens: list[str] = []
 
     async def run(self) -> None:
-        """Main loop: update prices, check exits, take snapshots."""
+        """Main loop: process candidates, monitor positions, take snapshots."""
         self._running = True
-        logger.info("paper_worker.starting")
+        logger.info(
+            "paper_worker.starting",
+            enabled=settings.PAPER_TRADING_ENABLED,
+            dry_run=settings.PAPER_TRADING_DRY_RUN,
+        )
+
+        # Lazily initialize pricing service
+        await self._init_pricing()
 
         while self._running:
             try:
-                await self._update_cycle()
+                await self._lifecycle_cycle()
+                self._cycle_count += 1
             except Exception as e:
-                logger.error("paper_worker.error", error=str(e))
-            await asyncio.sleep(60)  # 1 minute interval
+                logger.error("paper_worker.cycle_error", error=str(e))
+            await asyncio.sleep(60)
 
         logger.info("paper_worker.stopped")
 
@@ -44,71 +84,784 @@ class PaperTradingWorker:
         """Signal shutdown."""
         self._running = False
 
-    async def _update_cycle(self) -> None:
-        """Run one update cycle."""
-        # 1. Update prices for all open positions
-        await self._update_prices()
+    async def _init_pricing(self) -> None:
+        """Initialize PricingService (Jupiter + Redis cache)."""
+        try:
+            from redis.asyncio import Redis
 
-        # 2. Check exit conditions
-        exits = await self._simulator.check_exits()
-        for exit in exits:
-            self._outcomes.record_outcome(
-                position_id=exit["position_id"],
-                token=exit["token"],
-                entry_price=exit["entry_price"],
-                exit_price=exit["exit_price"],
-                quantity=exit["quantity"],
-                holding_hours=exit["holding_period_hours"],
-                exit_reason=exit["exit_reason"],
-                signal_attribution=exit.get("signal_attribution", {}),
+            from app.analytics.pricing_service import PricingService
+            from app.infrastructure.external.jupiter_client import (
+                JupiterPriceClient,
+            )
+            from app.infrastructure.redis.price_cache import TokenPriceCache
+
+            redis = Redis.from_url(settings.REDIS_CACHE_URL, decode_responses=True)
+            jupiter = JupiterPriceClient()
+            cache = TokenPriceCache(redis)
+            self._pricing = PricingService(jupiter, cache)
+            logger.info("paper_worker.pricing_initialized")
+        except Exception as e:
+            logger.warning("paper_worker.pricing_init_failed", error=str(e))
+            self._pricing = None
+
+    async def _lifecycle_cycle(self) -> None:
+        """Run one lifecycle cycle."""
+        now = datetime.now(timezone.utc)
+
+        # 1. Monitor OPEN positions (price refresh + exit check)
+        await self._monitor_positions()
+
+        # 2. Periodic portfolio snapshot
+        if self._should_snapshot(now):
+            await self._take_snapshot(now)
+            self._last_snapshot = now
+
+        logger.debug("paper_worker.cycle_done", cycle=self._cycle_count)
+
+    # ── Candidate Processing ────────────────────────────────
+
+    async def process_candidate(self, candidate: dict[str, Any]) -> None:
+        """Process a single paper trading candidate.
+
+        Called by the stream consumer or directly by RankingWorker.
+        """
+        token = candidate.get("token", "")
+        score = candidate.get("score", 0)
+        rank = candidate.get("rank", 0)
+
+        if not token:
+            return
+
+        # Guard: dry-run mode — record SKIPPED, never create OPEN position
+        if not settings.PAPER_TRADING_ENABLED or settings.PAPER_TRADING_DRY_RUN:
+            await self._persist_skipped(
+                token=token,
+                score=score,
+                rank=rank,
+                reason="dry_run_mode",
+                candidate=candidate,
+            )
+            logger.info(
+                "paper.candidate_dry_run",
+                token=token[:16],
+                score=score,
+                rank=rank,
+            )
+            return
+
+        # Guard: max open positions
+        open_count = await self._count_open_positions()
+        if open_count >= settings.PAPER_MAX_POSITIONS:
+            await self._persist_skipped(
+                token=token,
+                score=score,
+                rank=rank,
+                reason="max_positions_reached",
+                candidate=candidate,
+            )
+            return
+
+        # Guard: already have open position for this token
+        if await self._has_open_position(token):
+            await self._persist_skipped(
+                token=token,
+                score=score,
+                rank=rank,
+                reason="duplicate_token",
+                candidate=candidate,
+            )
+            return
+
+        # Guard: token activity filter
+        activity = await self._check_token_activity(token)
+        if not activity["passed"]:
+            await self._persist_skipped(
+                token=token,
+                score=score,
+                rank=rank,
+                reason=activity["skip_reason"],
+                candidate=candidate,
+                activity_data=activity,
+            )
+            return
+
+        # Fetch entry price
+        entry_price = await self._fetch_price(token)
+        if entry_price is None or entry_price <= 0:
+            await self._persist_skipped(
+                token=token,
+                score=score,
+                rank=rank,
+                reason="price_unavailable",
+                candidate=candidate,
+            )
+            return
+
+        # Create OPEN position in DB
+        await self._persist_open_position(
+            token=token,
+            score=score,
+            rank=rank,
+            entry_price=entry_price,
+            candidate=candidate,
+        )
+
+    # ── Position Monitoring ─────────────────────────────────
+
+    async def _monitor_positions(self) -> None:
+        """Refresh prices and check exit conditions for all OPEN positions."""
+        if not self._session_factory:
+            return
+
+        session = self._session_factory()
+        try:
+            stmt = select(PaperPosition).where(PaperPosition.status == "OPEN")
+            result = await session.execute(stmt)
+            positions = result.scalars().all()
+
+            if not positions:
+                return
+
+            for pos in positions:
+                await self._check_position_exit(session, pos)
+
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            logger.error("paper_worker.monitor_error", error=str(e))
+        finally:
+            await session.close()
+
+    async def _check_position_exit(
+        self, session: Any, pos: PaperPosition
+    ) -> None:
+        """Check if a position should be closed based on exit rules.
+
+        Also updates position metadata with current_price, current_roi,
+        max_return, and max_drawdown for observability.
+        """
+        current_price = await self._fetch_price(pos.token_mint)
+        if current_price is None or current_price <= 0:
+            return
+
+        if not pos.entry_price or pos.entry_price <= 0:
+            return
+
+        roi_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100
+        now = datetime.now(timezone.utc)
+
+        # Update position metadata with live metrics
+        meta = dict(pos.metadata_json or {})
+        meta["current_price"] = round(current_price, 10)
+        meta["current_roi"] = round(roi_pct, 4)
+
+        prev_max_return = meta.get("max_return", 0.0)
+        prev_max_drawdown = meta.get("max_drawdown", 0.0)
+        meta["max_return"] = round(max(prev_max_return, roi_pct), 4)
+        meta["max_drawdown"] = round(min(prev_max_drawdown, roi_pct), 4)
+        meta["last_price_update"] = now.isoformat()
+        pos.metadata_json = meta
+
+        # Determine exit reason
+        exit_reason: str | None = None
+
+        if roi_pct >= TAKE_PROFIT_2_PCT:
+            exit_reason = "TAKE_PROFIT_2"
+        elif roi_pct >= TAKE_PROFIT_1_PCT:
+            exit_reason = "TAKE_PROFIT_1"
+        elif roi_pct <= STOP_LOSS_PCT:
+            exit_reason = "STOP_LOSS"
+        elif pos.opened_at:
+            hours_open = (now - pos.opened_at).total_seconds() / 3600
+            if hours_open >= TIMEOUT_HOURS:
+                exit_reason = "TIMEOUT"
+
+        if exit_reason:
+            await self._close_position(session, pos, current_price, roi_pct, exit_reason, now)
+        else:
+            logger.info(
+                "paper.position_updated",
+                token=pos.token_mint[:16],
+                current_price=round(current_price, 10),
+                roi_pct=round(roi_pct, 4),
+                max_return=meta["max_return"],
+                max_drawdown=meta["max_drawdown"],
             )
 
-        # 3. Take portfolio snapshot
-        snapshot = await self._portfolio.take_snapshot()
+    async def _close_position(
+        self,
+        session: Any,
+        pos: PaperPosition,
+        exit_price: float,
+        roi_pct: float,
+        exit_reason: str,
+        now: datetime,
+        outcome_status: str | None = None,
+    ) -> None:
+        """Close a position and record the outcome."""
+        virtual_size = pos.virtual_size_usd or settings.PAPER_POSITION_SIZE_USD
+        pnl_usd = virtual_size * (roi_pct / 100)
+
+        # Update position
+        pos.status = "CLOSED"
+        pos.exit_reason = exit_reason
+        pos.closed_at = now
+        pos.metadata_json = {
+            **(pos.metadata_json or {}),
+            "exit_price": exit_price,
+            "roi_pct": round(roi_pct, 4),
+            "pnl_usd": round(pnl_usd, 4),
+        }
+
+        # Determine outcome status (use override if provided)
+        if outcome_status is None:
+            if roi_pct > 0:
+                outcome_status = "WIN"
+            elif roi_pct < 0:
+                outcome_status = "LOSS"
+            else:
+                outcome_status = "BREAKEVEN"
+
+        # Record outcome
+        outcome = PaperTradeOutcome(
+            id=uuid.uuid4(),
+            position_id=pos.id,
+            token_mint=pos.token_mint,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            roi=round(roi_pct, 4),
+            pnl_usd=round(pnl_usd, 4),
+            max_drawdown=round(min(0, roi_pct), 4),
+            max_return=round(max(0, roi_pct), 4),
+            holding_seconds=int(
+                (now - pos.opened_at).total_seconds() if pos.opened_at else 0
+            ),
+            outcome_status=outcome_status,
+            created_at=now,
+        )
+        session.add(outcome)
 
         logger.info(
-            "paper_worker.cycle_complete",
-            open_positions=snapshot.open_positions,
-            portfolio_value=snapshot.total_value,
-            win_rate=snapshot.win_rate,
+            "paper.position_closed",
+            token=pos.token_mint[:16],
+            roi_pct=round(roi_pct, 4),
+            pnl_usd=round(pnl_usd, 4),
+            exit_reason=exit_reason,
+            outcome=outcome_status,
         )
 
-    async def _update_prices(self) -> None:
-        """Update prices for all open positions."""
-        for position in self._position_mgr.get_open_positions():
-            # Get current price from cache or API
-            current_price = self._price_cache.get(position.token, position.entry_price)
-            await self._position_mgr.update_price(position.position_id, current_price)
+    async def close_position_by_token(
+        self,
+        token_mint: str,
+        exit_reason: str,
+        outcome_status: str = "INVALID_CANDIDATE",
+    ) -> bool:
+        """Close an OPEN position for a specific token with custom reason.
 
-    async def process_prediction(
+        Used for administrative closes (e.g., STALE_ACTIVITY).
+        Returns True if position was closed, False if not found.
+        """
+        if not self._session_factory:
+            return False
+
+        session = self._session_factory()
+        try:
+            stmt = select(PaperPosition).where(
+                PaperPosition.token_mint == token_mint,
+                PaperPosition.status == "OPEN",
+            )
+            result = await session.execute(stmt)
+            pos = result.scalar_one_or_none()
+
+            if pos is None:
+                logger.warning("paper.close_not_found", token=token_mint[:16])
+                return False
+
+            # Use current price if available, else entry price
+            exit_price = await self._fetch_price(token_mint)
+            if exit_price is None or exit_price <= 0:
+                meta = pos.metadata_json or {}
+                exit_price = meta.get("current_price", pos.entry_price or 0)
+
+            if not pos.entry_price or pos.entry_price <= 0:
+                roi_pct = 0.0
+            else:
+                roi_pct = ((exit_price - pos.entry_price) / pos.entry_price) * 100
+
+            now = datetime.now(timezone.utc)
+            await self._close_position(session, pos, exit_price, roi_pct, exit_reason, now, outcome_status)
+            await session.commit()
+
+            logger.info(
+                "paper.position_closed_manual",
+                token=token_mint[:16],
+                exit_reason=exit_reason,
+                outcome_status=outcome_status,
+                roi_pct=round(roi_pct, 4),
+            )
+            return True
+
+        except Exception as e:
+            await session.rollback()
+            logger.error("paper.close_manual_error", token=token_mint[:16], error=str(e))
+            return False
+        finally:
+            await session.close()
+
+    # ── Token Activity Check ────────────────────────────────
+
+    async def _check_token_activity(self, token: str) -> dict[str, Any]:
+        """Check if a token has recent trading activity.
+
+        Returns dict with:
+        - passed: bool
+        - skip_reason: str (empty if passed)
+        - last_activity_age_minutes: float
+        - events_15m: int
+        - unique_wallets_15m: int
+        """
+        if not self._session_factory:
+            return {"passed": False, "skip_reason": "no_session", "last_activity_age_minutes": -1, "events_15m": 0, "unique_wallets_15m": 0}
+
+        session = self._session_factory()
+        try:
+            now = datetime.now(timezone.utc)
+            cutoff_15m = now - timedelta(minutes=15)
+            max_age = timedelta(minutes=settings.PAPER_MAX_TOKEN_ACTIVITY_AGE_MINUTES)
+
+            # 1. Last activity age from wallet_positions
+            last_activity_stmt = (
+                select(func.max(WalletPosition.last_trade_at))
+                .where(WalletPosition.token_mint == token)
+            )
+            last_activity_result = await session.execute(last_activity_stmt)
+            last_activity = last_activity_result.scalar()
+
+            if last_activity is None:
+                return {"passed": False, "skip_reason": "stale_token_activity", "last_activity_age_minutes": -1, "events_15m": 0, "unique_wallets_15m": 0}
+
+            if last_activity.tzinfo is None:
+                last_activity = last_activity.replace(tzinfo=timezone.utc)
+
+            age = now - last_activity
+            age_minutes = age.total_seconds() / 60
+
+            if age > max_age:
+                return {
+                    "passed": False,
+                    "skip_reason": "stale_token_activity",
+                    "last_activity_age_minutes": round(age_minutes, 1),
+                    "events_15m": 0,
+                    "unique_wallets_15m": 0,
+                }
+
+            # 2. Unique wallets trading this token in last 15m
+            wallets_stmt = (
+                select(func.count(func.distinct(WalletPosition.wallet)))
+                .where(
+                    WalletPosition.token_mint == token,
+                    WalletPosition.last_trade_at >= cutoff_15m,
+                )
+            )
+            wallets_result = await session.execute(wallets_stmt)
+            unique_wallets = wallets_result.scalar() or 0
+
+            # 3. Events mentioning this token in last 15m (from raw_events payload)
+            events_stmt = text("""
+                SELECT COUNT(*) FROM raw_events
+                WHERE created_at >= :cutoff
+                AND (
+                    payload::text LIKE :token_pattern
+                    OR metadata::text LIKE :token_pattern
+                )
+            """)
+            events_result = await session.execute(events_stmt, {
+                "cutoff": cutoff_15m,
+                "token_pattern": f"%{token}%",
+            })
+            events_15m = events_result.scalar() or 0
+
+            # 4. Check thresholds
+            if events_15m < settings.PAPER_MIN_TOKEN_EVENTS_15M:
+                return {
+                    "passed": False,
+                    "skip_reason": "insufficient_token_activity",
+                    "last_activity_age_minutes": round(age_minutes, 1),
+                    "events_15m": events_15m,
+                    "unique_wallets_15m": unique_wallets,
+                }
+
+            if unique_wallets < settings.PAPER_MIN_UNIQUE_WALLETS_15M:
+                return {
+                    "passed": False,
+                    "skip_reason": "insufficient_token_activity",
+                    "last_activity_age_minutes": round(age_minutes, 1),
+                    "events_15m": events_15m,
+                    "unique_wallets_15m": unique_wallets,
+                }
+
+            return {
+                "passed": True,
+                "skip_reason": "",
+                "last_activity_age_minutes": round(age_minutes, 1),
+                "events_15m": events_15m,
+                "unique_wallets_15m": unique_wallets,
+            }
+
+        except Exception as e:
+            logger.warning("paper.activity_check_error", token=token[:16], error=str(e)[:100])
+            return {"passed": False, "skip_reason": "activity_check_error", "last_activity_age_minutes": -1, "events_15m": 0, "unique_wallets_15m": 0}
+        finally:
+            await session.close()
+
+    # ── Price Fetching ──────────────────────────────────────
+
+    async def _fetch_price(self, token_mint: str) -> float | None:
+        """Fetch current price for a token via PricingService."""
+        if not self._pricing:
+            return None
+        try:
+            price_obj = await self._pricing.get_price(token_mint)
+            if price_obj and price_obj.price:
+                self._price_success_count += 1
+                return float(price_obj.price)
+            else:
+                self._price_failure_count += 1
+                if token_mint not in self._price_unavailable_tokens:
+                    self._price_unavailable_tokens.append(token_mint)
+                    # Keep only last 20 unavailable tokens
+                    if len(self._price_unavailable_tokens) > 20:
+                        self._price_unavailable_tokens = self._price_unavailable_tokens[-20:]
+        except Exception as e:
+            self._price_failure_count += 1
+            logger.warning("paper.price_fetch_error", token=token_mint[:16], error=str(e)[:100])
+        return None
+
+    # ── DB Persistence ──────────────────────────────────────
+
+    async def _persist_skipped(
         self,
         token: str,
-        current_price: float,
-        prediction_score: float,
-        confidence: float,
-        regime: str,
-        signal_breakdown: dict[str, float],
-        cluster_id: str,
-        smart_money_present: bool,
-    ) -> dict[str, Any] | None:
-        """Process a live prediction and create position if warranted."""
-        return await self._simulator.simulate_trade(
-            token=token,
-            current_price=current_price,
-            prediction_score=prediction_score,
-            confidence=confidence,
-            regime=regime,
-            signal_breakdown=signal_breakdown,
-            cluster_id=cluster_id,
-            smart_money_present=smart_money_present,
-        )
+        score: float,
+        rank: int,
+        reason: str,
+        candidate: dict[str, Any],
+        activity_data: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist a SKIPPED candidate record for visibility.
 
-    def get_portfolio_summary(self) -> dict[str, Any]:
-        """Get current portfolio summary."""
-        pm = self._position_mgr
+        Deduplicates: if the same token was already SKIPPED for the same reason
+        within the last ranking window, skip the insert to reduce noise.
+        """
+        if not self._session_factory:
+            return
+
+        session = self._session_factory()
+        try:
+            # Dedup check: same token + same reason within last window
+            window_cutoff = datetime.now(timezone.utc) - timedelta(
+                minutes=settings.RANKING_WINDOW_MINUTES
+            )
+            dedup_stmt = (
+                select(func.count())
+                .select_from(PaperPosition)
+                .where(
+                    PaperPosition.token_mint == token,
+                    PaperPosition.status == "SKIPPED",
+                    PaperPosition.created_at >= window_cutoff,
+                    PaperPosition.metadata_json["skip_reason"].as_string() == reason,
+                )
+            )
+            dedup_result = await session.execute(dedup_stmt)
+            if (dedup_result.scalar() or 0) > 0:
+                return
+
+            record = PaperPosition(
+                id=uuid.uuid4(),
+                token_mint=token,
+                entry_score=score,
+                virtual_size_usd=0,
+                status="SKIPPED",
+                opened_at=datetime.now(timezone.utc),
+                metadata_json={
+                    "rank": rank,
+                    "skip_reason": reason,
+                    "regime": candidate.get("regime", ""),
+                    "stage": candidate.get("stage", ""),
+                    "alpha_score": candidate.get("alpha_score", 0),
+                    "confidence": candidate.get("confidence", 0),
+                    **({"token_activity": activity_data} if activity_data else {}),
+                },
+            )
+            session.add(record)
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            logger.error("paper.persist_skipped_error", token=token[:16], error=str(e))
+        finally:
+            await session.close()
+
+    async def _persist_open_position(
+        self,
+        token: str,
+        score: float,
+        rank: int,
+        entry_price: float,
+        candidate: dict[str, Any],
+    ) -> None:
+        """Persist an OPEN paper position."""
+        if not self._session_factory:
+            return
+
+        # Position size = virtual_capital * risk_per_trade
+        position_size_usd = settings.PAPER_VIRTUAL_CAPITAL * settings.PAPER_RISK_PER_TRADE
+
+        session = self._session_factory()
+        try:
+            record = PaperPosition(
+                id=uuid.uuid4(),
+                token_mint=token,
+                entry_score=score,
+                entry_price=entry_price,
+                virtual_size_usd=round(position_size_usd, 2),
+                status="OPEN",
+                opened_at=datetime.now(timezone.utc),
+                metadata_json={
+                    "rank": rank,
+                    "regime": candidate.get("regime", ""),
+                    "stage": candidate.get("stage", ""),
+                    "alpha_score": candidate.get("alpha_score", 0),
+                    "confidence": candidate.get("confidence", 0),
+                    "signals": candidate.get("signals", {}),
+                },
+            )
+            session.add(record)
+            await session.commit()
+
+            logger.info(
+                "paper.position_opened",
+                token=token[:16],
+                entry_price=entry_price,
+                score=score,
+                rank=rank,
+                size_usd=round(position_size_usd, 2),
+            )
+        except Exception as e:
+            await session.rollback()
+            logger.error("paper.persist_open_error", token=token[:16], error=str(e))
+        finally:
+            await session.close()
+
+    async def _count_open_positions(self) -> int:
+        """Count currently OPEN positions."""
+        if not self._session_factory:
+            return 0
+        session = self._session_factory()
+        try:
+            stmt = select(func.count()).select_from(PaperPosition).where(
+                PaperPosition.status == "OPEN"
+            )
+            result = await session.execute(stmt)
+            return result.scalar() or 0
+        finally:
+            await session.close()
+
+    async def _has_open_position(self, token: str) -> bool:
+        """Check if we already have an OPEN position for this token."""
+        if not self._session_factory:
+            return False
+        session = self._session_factory()
+        try:
+            stmt = select(func.count()).select_from(PaperPosition).where(
+                PaperPosition.token_mint == token,
+                PaperPosition.status == "OPEN",
+            )
+            result = await session.execute(stmt)
+            return (result.scalar() or 0) > 0
+        finally:
+            await session.close()
+
+    # ── Snapshots ───────────────────────────────────────────
+
+    def _should_snapshot(self, now: datetime) -> bool:
+        """Check if it's time for a portfolio snapshot."""
+        if self._last_snapshot is None:
+            return True
+        interval = timedelta(seconds=settings.PAPER_SNAPSHOT_INTERVAL_SECONDS)
+        return (now - self._last_snapshot) >= interval
+
+    async def _take_snapshot(self, now: datetime) -> None:
+        """Take a portfolio snapshot and persist to DB."""
+        if not self._session_factory:
+            return
+
+        session = self._session_factory()
+        try:
+            # Count positions by status
+            open_count = await self._count_open_in_session(session)
+            closed_count = await self._count_closed_in_session(session)
+            skipped_count = await self._count_skipped_in_session(session)
+
+            # Sum realized PnL from closed outcomes
+            realized_pnl = await self._sum_realized_pnl(session)
+
+            # Compute unrealized PnL from open positions
+            unrealized_pnl = 0.0
+            open_stmt = select(PaperPosition).where(PaperPosition.status == "OPEN")
+            result = await session.execute(open_stmt)
+            open_positions = result.scalars().all()
+            for pos in open_positions:
+                meta = pos.metadata_json or {}
+                current_roi = meta.get("current_roi")
+                if current_roi is not None and pos.virtual_size_usd:
+                    unrealized_pnl += pos.virtual_size_usd * (current_roi / 100)
+
+            virtual_capital = settings.PAPER_VIRTUAL_CAPITAL
+            portfolio_value = virtual_capital + realized_pnl + unrealized_pnl
+
+            snapshot = PaperPortfolioSnapshot(
+                id=uuid.uuid4(),
+                portfolio_value=round(portfolio_value, 4),
+                cash_balance=round(virtual_capital, 4),
+                open_positions_count=open_count,
+                unrealized_pnl=round(unrealized_pnl, 4),
+                realized_pnl=round(realized_pnl, 4),
+                created_at=now,
+            )
+            session.add(snapshot)
+            await session.commit()
+
+            logger.info(
+                "paper.snapshot_taken",
+                portfolio_value=round(portfolio_value, 2),
+                open=open_count,
+                closed=closed_count,
+                realized_pnl=round(realized_pnl, 4),
+                unrealized_pnl=round(unrealized_pnl, 4),
+            )
+        except Exception as e:
+            await session.rollback()
+            logger.error("paper.snapshot_error", error=str(e))
+        finally:
+            await session.close()
+
+    async def _count_open_in_session(self, session: Any) -> int:
+        stmt = select(func.count()).select_from(PaperPosition).where(
+            PaperPosition.status == "OPEN"
+        )
+        result = await session.execute(stmt)
+        return result.scalar() or 0
+
+    async def _count_closed_in_session(self, session: Any) -> int:
+        stmt = select(func.count()).select_from(PaperPosition).where(
+            PaperPosition.status == "CLOSED"
+        )
+        result = await session.execute(stmt)
+        return result.scalar() or 0
+
+    async def _count_skipped_in_session(self, session: Any) -> int:
+        stmt = select(func.count()).select_from(PaperPosition).where(
+            PaperPosition.status == "SKIPPED"
+        )
+        result = await session.execute(stmt)
+        return result.scalar() or 0
+
+    async def _sum_realized_pnl(self, session: Any) -> float:
+        stmt = select(func.coalesce(func.sum(PaperTradeOutcome.pnl_usd), 0.0))
+        result = await session.execute(stmt)
+        return float(result.scalar() or 0.0)
+
+    # ── Status (for API) ────────────────────────────────────
+
+    async def get_status(self) -> dict[str, Any]:
+        """Get paper trading status for API endpoint."""
+        if not self._session_factory:
+            return self._empty_status()
+
+        session = self._session_factory()
+        try:
+            open_count = await self._count_open_in_session(session)
+            closed_count = await self._count_closed_in_session(session)
+            skipped_count = await self._count_skipped_in_session(session)
+            realized_pnl = await self._sum_realized_pnl(session)
+
+            # Latest candidates (last 10 SKIPPED for visibility)
+            latest_stmt = (
+                select(PaperPosition)
+                .where(PaperPosition.status == "SKIPPED")
+                .order_by(PaperPosition.created_at.desc())
+                .limit(10)
+            )
+            latest_result = await session.execute(latest_stmt)
+            latest_skipped = latest_result.scalars().all()
+
+            candidates = []
+            skip_reasons = {}
+            for pos in latest_skipped:
+                meta = pos.metadata_json or {}
+                candidates.append({
+                    "token": pos.token_mint,
+                    "score": pos.entry_score,
+                    "rank": meta.get("rank", 0),
+                    "regime": meta.get("regime", ""),
+                    "stage": meta.get("stage", ""),
+                    "skip_reason": meta.get("skip_reason", ""),
+                    "created_at": pos.created_at.isoformat() if pos.created_at else "",
+                })
+                reason = meta.get("skip_reason", "unknown")
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+
+            # Last snapshot
+            snapshot_stmt = (
+                select(PaperPortfolioSnapshot)
+                .order_by(PaperPortfolioSnapshot.created_at.desc())
+                .limit(1)
+            )
+            snapshot_result = await session.execute(snapshot_stmt)
+            last_snapshot = snapshot_result.scalar_one_or_none()
+
+            virtual_capital = settings.PAPER_VIRTUAL_CAPITAL
+
+            return {
+                "enabled": settings.PAPER_TRADING_ENABLED,
+                "dry_run": settings.PAPER_TRADING_DRY_RUN,
+                "open_positions": open_count,
+                "closed_positions": closed_count,
+                "skipped_positions": skipped_count,
+                "latest_candidates": candidates,
+                "latest_skip_reasons": skip_reasons,
+                "portfolio_value": round(virtual_capital + realized_pnl, 2),
+                "realized_pnl": round(realized_pnl, 4),
+                "last_snapshot_time": (
+                    last_snapshot.created_at.isoformat()
+                    if last_snapshot and last_snapshot.created_at
+                    else None
+                ),
+                "virtual_capital": virtual_capital,
+                "cycle_count": self._cycle_count,
+                "latest_price_success_count": self._price_success_count,
+                "latest_price_failure_count": self._price_failure_count,
+                "latest_price_unavailable_tokens": self._price_unavailable_tokens[-5:],
+            }
+        finally:
+            await session.close()
+
+    def _empty_status(self) -> dict[str, Any]:
+        """Return empty status when no session factory."""
         return {
-            "portfolio_value": pm.get_portfolio_value(),
-            "cash": pm._cash,
-            "open_positions": len(pm.get_open_positions()),
-            "closed_positions": len(pm.get_closed_positions()),
+            "enabled": settings.PAPER_TRADING_ENABLED,
+            "dry_run": settings.PAPER_TRADING_DRY_RUN,
+            "open_positions": 0,
+            "closed_positions": 0,
+            "skipped_positions": 0,
+            "latest_candidates": [],
+            "latest_skip_reasons": {},
+            "portfolio_value": 0,
+            "realized_pnl": 0,
+            "last_snapshot_time": None,
+            "virtual_capital": 0,
+            "cycle_count": self._cycle_count,
+            "latest_price_success_count": self._price_success_count,
+            "latest_price_failure_count": self._price_failure_count,
+            "latest_price_unavailable_tokens": self._price_unavailable_tokens[-5:],
         }

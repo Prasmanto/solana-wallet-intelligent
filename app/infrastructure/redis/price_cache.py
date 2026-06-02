@@ -22,8 +22,8 @@ from app.schemas.pricing import TokenPrice, PriceSnapshot
 logger = structlog.get_logger(__name__)
 
 # Cache TTLs
-PRICE_TTL_SECONDS = 300  # 5 minutes
-STALE_THRESHOLD_SECONDS = 300  # Consider stale after 5 minutes
+PRICE_TTL_SECONDS = 60  # 60 seconds
+STALE_THRESHOLD_SECONDS = 60  # Consider stale after 60 seconds
 
 
 class TokenPriceCache:

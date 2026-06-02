@@ -106,6 +106,38 @@ class Settings(BaseSettings):
     def R2_S3_ENDPOINT(self) -> str:
         return self.R2_ENDPOINT_URL or f"https://{self.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
+    # ── Ranking ─────────────────────────────────────────────
+    RANKING_RETENTION_HOURS: int = 24
+    RANKING_WINDOW_MINUTES: int = 5
+    RANKING_MAX_TOKENS: int = 100
+
+    # ── Paper Trading ───────────────────────────────────────
+    PAPER_TRADING_ENABLED: bool = False
+    PAPER_TRADING_DRY_RUN: bool = True
+    PAPER_POSITION_SIZE_USD: float = 100.0
+    PAPER_MAX_POSITIONS: int = 20
+    PAPER_ENTRY_SCORE_THRESHOLD: float = 0.65
+    PAPER_MAX_RANK: int = 20
+    PAPER_SNAPSHOT_INTERVAL_SECONDS: int = 300
+    PAPER_VIRTUAL_CAPITAL: float = 100000.0
+    PAPER_RISK_PER_TRADE: float = 0.01
+    PAPER_SKIP_TOKENS: list[str] = Field(
+        default=[
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+            "So11111111111111111111111111111111111111112",      # Wrapped SOL
+        ],
+    )
+    PAPER_MAX_TOKEN_ACTIVITY_AGE_MINUTES: int = 30
+    PAPER_MIN_TOKEN_EVENTS_15M: int = 10
+    PAPER_MIN_UNIQUE_WALLETS_15M: int = 5
+
+    # ── Jupiter Price API ──────────────────────────────────
+    JUPITER_PRICE_BASE_URL: str = "https://lite-api.jup.ag/price/v3"
+
+    # ── Redis Streams Retention ────────────────────────────
+    REDIS_STREAM_MAXLEN: int = 10000
+
 
 @lru_cache
 def get_settings() -> Settings:

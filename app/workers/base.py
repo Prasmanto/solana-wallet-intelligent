@@ -68,6 +68,7 @@ class ConsumerWorker(ABC):
     recovery_interval: float = 30.0
     recovery_idle_ms: int = 60_000
     max_retries: int = 5
+    max_nogroup_backoff: float = 5.0
 
     def __init__(
         self,
@@ -83,6 +84,7 @@ class ConsumerWorker(ABC):
         self._tasks: set[asyncio.Task] = set()
         self._shutdown_event = asyncio.Event()
         self._start_time: float = 0
+        self._consecutive_empty: int = 0
 
         if not self.consumer:
             import socket
@@ -152,8 +154,16 @@ class ConsumerWorker(ABC):
         )
 
         if not messages:
-            await asyncio.sleep(self.poll_interval)
+            self._consecutive_empty += 1
+            # Exponential backoff capped at max_nogroup_backoff
+            backoff = min(
+                self.poll_interval * (2 ** min(self._consecutive_empty, 10)),
+                self.max_nogroup_backoff,
+            )
+            await asyncio.sleep(backoff)
             return
+
+        self._consecutive_empty = 0
 
         for redis_id, fields in messages:
             envelope = EventEnvelope.from_dict(fields)

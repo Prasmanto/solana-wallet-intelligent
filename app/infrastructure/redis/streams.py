@@ -14,6 +14,7 @@ from typing import Any
 import structlog
 from redis.asyncio import Redis
 
+from app.config.settings import settings
 from app.core.domain.stream_names import StreamName
 
 logger = structlog.get_logger(__name__)
@@ -83,14 +84,15 @@ class StreamsManager:
         stream: str,
         fields: dict[str, str],
     ) -> str:
-        """Append an event to a stream.
+        """Append an event to a stream with automatic trimming.
 
-        Returns the Redis-generated event ID (timestamp-sequence).
+        Uses XADD MAXLEN ~ to cap stream at REDIS_STREAM_MAXLEN entries.
+        The ~ operator lets Redis optimize trimming internally.
         """
         event_id = await self._redis.xadd(
             stream,
             fields,
-            maxlen=100_000,  # cap stream at 100k entries
+            maxlen=settings.REDIS_STREAM_MAXLEN,
             approximate=True,
         )
         logger.debug("streams.appended", stream=stream, redis_id=event_id)
@@ -120,12 +122,38 @@ class StreamsManager:
                 block=block_ms,
             )
         except Exception as e:
-            logger.error(
-                "streams.read_error",
-                stream=stream,
-                group=group,
-                error=str(e),
-            )
+            error_str = str(e)
+            if "NOGROUP" in error_str:
+                # Recreate stream and consumer group on NOGROUP
+                logger.warning(
+                    "streams.nogroup_recovering",
+                    stream=stream,
+                    group=group,
+                )
+                try:
+                    await self._redis.xgroup_create(
+                        stream, group, id="0", mkstream=True
+                    )
+                    logger.info(
+                        "streams.nogroup_recovered",
+                        stream=stream,
+                        group=group,
+                    )
+                except Exception as create_err:
+                    if "BUSYGROUP" not in str(create_err):
+                        logger.error(
+                            "streams.nogroup_recreate_failed",
+                            stream=stream,
+                            group=group,
+                            error=str(create_err),
+                        )
+            else:
+                logger.error(
+                    "streams.read_error",
+                    stream=stream,
+                    group=group,
+                    error=error_str,
+                )
             return []
 
         messages: list[tuple[str, dict[str, str]]] = []
@@ -209,7 +237,7 @@ class StreamsManager:
         dlq_id = await self._redis.xadd(
             StreamName.DEAD_LETTER,
             fields,
-            maxlen=50_000,
+            maxlen=max(10_000, settings.REDIS_STREAM_MAXLEN // 2),
             approximate=True,
         )
         logger.warning(
@@ -255,3 +283,45 @@ class StreamsManager:
         if removed > 0:
             logger.info("streams.trimmed", stream=stream, removed=removed)
         return removed
+
+    async def trim_all_streams(self, max_len: int | None = None) -> dict[str, int]:
+        """Trim all known streams to max_len. Returns dict of stream -> removed count."""
+        if max_len is None:
+            max_len = settings.REDIS_STREAM_MAXLEN
+        results: dict[str, int] = {}
+        for stream in StreamName.ALL:
+            try:
+                removed = await self._redis.xtrim(stream, maxlen=max_len, approximate=True)
+                results[stream] = removed
+                if removed > 0:
+                    logger.info("streams.trimmed", stream=stream, removed=removed, max_len=max_len)
+            except Exception as e:
+                results[stream] = -1
+                logger.warning("streams.trim_error", stream=stream, error=str(e)[:100])
+        return results
+
+    async def get_all_stream_info(self) -> dict[str, dict[str, Any]]:
+        """Get info for all known streams."""
+        info: dict[str, dict[str, Any]] = {}
+        for stream in StreamName.ALL:
+            try:
+                si = await self._redis.xinfo_stream(stream)
+                groups = []
+                try:
+                    gi = await self._redis.xinfo_groups(stream)
+                    for g in gi:
+                        groups.append({
+                            "name": g.get("name", ""),
+                            "consumers": g.get("consumers", 0),
+                            "pending": g.get("pending", 0),
+                        })
+                except Exception:
+                    pass
+                info[stream] = {
+                    "length": si.get("length", 0),
+                    "entries_added": si.get("entries-added", 0),
+                    "groups": groups,
+                }
+            except Exception:
+                info[stream] = {"length": 0, "entries_added": 0, "groups": []}
+        return info
