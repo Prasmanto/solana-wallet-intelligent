@@ -98,6 +98,15 @@ After each closed trade, the system applies lessons learned:
 - **Trailing stop** — locks in profits after +3% gain (2% drop trigger)
 - **Parabolic timeout** — 6h max hold instead of 24h for parabolic tokens
 
+### Token Price Snapshots
+
+Continuous price sampling for entry timing analysis. Captures Jupiter V3 prices at configurable intervals for ranked tokens and open positions.
+
+- **Collection:** automatic after batch rank computation (every 5 min) and during paper position lifecycle
+- **Dedup:** 120s window prevents duplicate snapshots for the same token
+- **Retention:** 7-day automatic cleanup
+- **Foundation for:** entry timing analysis (distance from local low, price change 15m/30m/60m), late-entry detection after pumps
+
 ```
 GET /api/v1/paper/status
 ```
@@ -141,7 +150,7 @@ app/
 │   ├── redis/           # Stream management, price cache
 │   └── external/        # Jupiter price client
 ├── parser/              # Helius event parser
-├── analytics/           # Metrics, pricing, features, daily scorecard
+├── analytics/           # Metrics, pricing, features, daily scorecard, snapshots
 ├── paper_trading/       # Position management, trade simulation
 ├── workers/             # Pipeline workers
 └── services/            # Business logic

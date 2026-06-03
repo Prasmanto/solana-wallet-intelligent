@@ -135,6 +135,13 @@ class Settings(BaseSettings):
     # ── Jupiter Price API ──────────────────────────────────
     JUPITER_PRICE_BASE_URL: str = "https://lite-api.jup.ag/price/v3"
 
+    # ── Price Snapshots ────────────────────────────────────
+    PRICE_SNAPSHOT_ENABLED: bool = True
+    PRICE_SNAPSHOT_INTERVAL_SECONDS: int = 300  # 5 min
+    PRICE_SNAPSHOT_RETENTION_DAYS: int = 7
+    PRICE_SNAPSHOT_TOP_RANKED_LIMIT: int = 50
+    PRICE_SNAPSHOT_DEDUP_WINDOW_SECONDS: int = 120
+
     # ── Redis Streams Retention ────────────────────────────
     REDIS_STREAM_MAXLEN: int = 10000
 

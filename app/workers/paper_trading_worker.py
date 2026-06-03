@@ -57,6 +57,10 @@ class PaperTradingWorker:
         self._price_success_count = 0
         self._price_failure_count = 0
         self._price_unavailable_tokens: list[str] = []
+        # Price snapshot integration
+        self._snapshot_service: Any = None
+        self._last_price_snapshot: datetime | None = None
+        self._last_retention_run: datetime | None = None
 
     async def run(self) -> None:
         """Main loop: process candidates, monitor positions, take snapshots."""
@@ -85,7 +89,7 @@ class PaperTradingWorker:
         self._running = False
 
     async def _init_pricing(self) -> None:
-        """Initialize PricingService (Jupiter + Redis cache)."""
+        """Initialize PricingService (Jupiter + Redis cache) and PriceSnapshotService."""
         try:
             from redis.asyncio import Redis
 
@@ -100,6 +104,12 @@ class PaperTradingWorker:
             cache = TokenPriceCache(redis)
             self._pricing = PricingService(jupiter, cache)
             logger.info("paper_worker.pricing_initialized")
+
+            # Initialize price snapshot service if enabled
+            if settings.PRICE_SNAPSHOT_ENABLED:
+                from app.analytics.price_snapshot_service import PriceSnapshotService
+                self._snapshot_service = PriceSnapshotService(self._pricing)
+                logger.info("paper_worker.snapshot_service_initialized")
         except Exception as e:
             logger.warning("paper_worker.pricing_init_failed", error=str(e))
             self._pricing = None
@@ -115,6 +125,16 @@ class PaperTradingWorker:
         if self._should_snapshot(now):
             await self._take_snapshot(now)
             self._last_snapshot = now
+
+        # 3. Price snapshot for open positions (non-fatal)
+        if self._snapshot_service and self._should_price_snapshot(now):
+            await self._capture_open_position_snapshots()
+            self._last_price_snapshot = now
+
+        # 4. Retention cleanup (hourly)
+        if self._should_run_retention(now):
+            await self._run_snapshot_retention()
+            self._last_retention_run = now
 
         logger.debug("paper_worker.cycle_done", cycle=self._cycle_count)
 
@@ -185,6 +205,56 @@ class PaperTradingWorker:
             )
             return
 
+        # Guard: parabolic entry confirmation (momentum filter)
+        regime = candidate.get("regime", "NORMAL")
+        stage = candidate.get("stage", "")
+        signals = candidate.get("signals", {})
+        # Use token_momentum (activity-based, continuous) if available,
+        # fall back to legacy momentum (win_rate-based, binary)
+        momentum = 0.0
+        if isinstance(signals, dict):
+            momentum = signals.get("token_momentum", 0) or 0
+            if momentum == 0:
+                momentum = signals.get("momentum", 0) or 0
+        smart_money = signals.get("smart_money", 0) if isinstance(signals, dict) else 0
+
+        if regime == "PARABOLIC" or stage == "HIGH_PUMP_RISK":
+            if momentum < settings.PAPER_PARABOLIC_MIN_MOMENTUM:
+                await self._persist_skipped(
+                    token=token,
+                    score=score,
+                    rank=rank,
+                    reason="parabolic_no_momentum_confirmation",
+                    candidate=candidate,
+                    activity_data={"momentum": momentum, "threshold": settings.PAPER_PARABOLIC_MIN_MOMENTUM},
+                )
+                return
+
+            # Guard: parabolic smart money confirmation
+            if smart_money < settings.PAPER_PARABOLIC_MIN_SMART_MONEY:
+                await self._persist_skipped(
+                    token=token,
+                    score=score,
+                    rank=rank,
+                    reason="parabolic_no_smart_money_confirmation",
+                    candidate=candidate,
+                    activity_data={"smart_money": smart_money, "threshold": settings.PAPER_PARABOLIC_MIN_SMART_MONEY},
+                )
+                return
+
+        # Guard: whale concentration filter
+        concentration = await self._check_whale_concentration(token)
+        if concentration is not None and concentration >= settings.PAPER_MAX_TOP_WALLET_CONCENTRATION:
+            await self._persist_skipped(
+                token=token,
+                score=score,
+                rank=rank,
+                reason="whale_concentration_risk",
+                candidate=candidate,
+                activity_data={"top_wallet_concentration": round(concentration, 4)},
+            )
+            return
+
         # Fetch entry price
         entry_price = await self._fetch_price(token)
         if entry_price is None or entry_price <= 0:
@@ -196,6 +266,9 @@ class PaperTradingWorker:
                 candidate=candidate,
             )
             return
+
+        # Capture price snapshot for candidate (non-fatal, best-effort)
+        await self._capture_candidate_snapshot(token, candidate)
 
         # Create OPEN position in DB
         await self._persist_open_position(
@@ -265,16 +338,34 @@ class PaperTradingWorker:
         # Determine exit reason
         exit_reason: str | None = None
 
-        if roi_pct >= TAKE_PROFIT_2_PCT:
-            exit_reason = "TAKE_PROFIT_2"
-        elif roi_pct >= TAKE_PROFIT_1_PCT:
-            exit_reason = "TAKE_PROFIT_1"
-        elif roi_pct <= STOP_LOSS_PCT:
-            exit_reason = "STOP_LOSS"
-        elif pos.opened_at:
-            hours_open = (now - pos.opened_at).total_seconds() / 3600
-            if hours_open >= TIMEOUT_HOURS:
-                exit_reason = "TIMEOUT"
+        # Trailing stop check (highest priority after TP)
+        if settings.PAPER_TRAILING_STOP_ENABLED:
+            max_ret = meta.get("max_return", 0.0)
+            if max_ret >= settings.PAPER_TRAILING_STOP_ACTIVATION_ROI:
+                trailing_level = max_ret - settings.PAPER_TRAILING_STOP_DROP_ROI
+                meta["trailing_stop_active"] = True
+                meta["trailing_stop_level"] = round(trailing_level, 4)
+                if roi_pct <= trailing_level:
+                    exit_reason = "TRAILING_STOP"
+
+        if exit_reason is None:
+            if roi_pct >= TAKE_PROFIT_2_PCT:
+                exit_reason = "TAKE_PROFIT_2"
+            elif roi_pct >= TAKE_PROFIT_1_PCT:
+                exit_reason = "TAKE_PROFIT_1"
+            elif roi_pct <= STOP_LOSS_PCT:
+                exit_reason = "STOP_LOSS"
+            elif pos.opened_at:
+                hours_open = (now - pos.opened_at).total_seconds() / 3600
+
+                # Parabolic max hold (shorter than normal timeout)
+                pos_regime = meta.get("regime", "NORMAL")
+                pos_stage = meta.get("stage", "")
+                if pos_regime == "PARABOLIC" or pos_stage == "HIGH_PUMP_RISK":
+                    if hours_open >= settings.PAPER_PARABOLIC_MAX_HOLD_HOURS:
+                        exit_reason = "PARABOLIC_TIMEOUT"
+                elif hours_open >= TIMEOUT_HOURS:
+                    exit_reason = "TIMEOUT"
 
         if exit_reason:
             await self._close_position(session, pos, current_price, roi_pct, exit_reason, now)
@@ -514,6 +605,45 @@ class PaperTradingWorker:
         finally:
             await session.close()
 
+    async def _check_whale_concentration(self, token: str) -> float | None:
+        """Check top wallet concentration for a token.
+
+        Returns concentration ratio (0.0-1.0) or None if data unavailable.
+        """
+        if not self._session_factory:
+            return None
+
+        session = self._session_factory()
+        try:
+            # Get total position size for this token
+            total_stmt = (
+                select(func.sum(WalletPosition.position_size))
+                .where(WalletPosition.token_mint == token)
+            )
+            total_result = await session.execute(total_stmt)
+            total_size = total_result.scalar()
+
+            if not total_size or total_size <= 0:
+                logger.info("paper.concentration_unavailable", token=token[:16])
+                return None
+
+            # Get top wallet position size
+            top_stmt = (
+                select(func.max(WalletPosition.position_size))
+                .where(WalletPosition.token_mint == token)
+            )
+            top_result = await session.execute(top_stmt)
+            top_size = top_result.scalar() or 0
+
+            concentration = top_size / total_size if total_size > 0 else 0
+            return concentration
+
+        except Exception as e:
+            logger.warning("paper.concentration_check_error", token=token[:16], error=str(e)[:100])
+            return None
+        finally:
+            await session.close()
+
     # ── Price Fetching ──────────────────────────────────────
 
     async def _fetch_price(self, token_mint: str) -> float | None:
@@ -633,6 +763,12 @@ class PaperTradingWorker:
                     "alpha_score": candidate.get("alpha_score", 0),
                     "confidence": candidate.get("confidence", 0),
                     "signals": candidate.get("signals", {}),
+                    "momentum": (candidate.get("signals", {}) or {}).get("token_momentum", 0) or (candidate.get("signals", {}) or {}).get("momentum", 0),
+                    "token_momentum": (candidate.get("signals", {}) or {}).get("token_momentum", 0),
+                    "wallet_quality_momentum": (candidate.get("signals", {}) or {}).get("wallet_quality_momentum", 0),
+                    "smart_money": (candidate.get("signals", {}) or {}).get("smart_money", 0),
+                    "trailing_stop_active": False,
+                    "trailing_stop_level": 0,
                 },
             )
             session.add(record)
@@ -742,6 +878,64 @@ class PaperTradingWorker:
         except Exception as e:
             await session.rollback()
             logger.error("paper.snapshot_error", error=str(e))
+        finally:
+            await session.close()
+
+    # ── Price Snapshot Helpers ─────────────────────────────
+
+    def _should_price_snapshot(self, now: datetime) -> bool:
+        """Check if it's time for a price snapshot of open positions."""
+        if self._last_price_snapshot is None:
+            return True
+        interval = timedelta(seconds=settings.PRICE_SNAPSHOT_INTERVAL_SECONDS)
+        return (now - self._last_price_snapshot) >= interval
+
+    def _should_run_retention(self, now: datetime) -> bool:
+        """Check if it's time to run snapshot retention (hourly)."""
+        if self._last_retention_run is None:
+            return True
+        return (now - self._last_retention_run) >= timedelta(hours=1)
+
+    async def _capture_candidate_snapshot(self, token: str, candidate: dict[str, Any]) -> None:
+        """Capture price snapshot for a paper candidate. Non-fatal."""
+        if not self._snapshot_service or not self._session_factory:
+            return
+        session = self._session_factory()
+        try:
+            await self._snapshot_service.capture_for_paper_candidate(
+                session, token, candidate_metadata=candidate
+            )
+        except Exception as e:
+            logger.debug("paper.snapshot_candidate_error", token=token[:16], error=str(e)[:100])
+        finally:
+            await session.close()
+
+    async def _capture_open_position_snapshots(self) -> None:
+        """Capture price snapshots for all open positions. Non-fatal."""
+        if not self._snapshot_service or not self._session_factory:
+            return
+        session = self._session_factory()
+        try:
+            # Get open position token mints
+            stmt = select(PaperPosition.token_mint).where(PaperPosition.status == "OPEN")
+            result = await session.execute(stmt)
+            tokens = [row[0] for row in result.fetchall()]
+            if tokens:
+                await self._snapshot_service.capture_for_open_positions(session, tokens)
+        except Exception as e:
+            logger.debug("paper.snapshot_open_error", error=str(e)[:100])
+        finally:
+            await session.close()
+
+    async def _run_snapshot_retention(self) -> None:
+        """Run price snapshot retention cleanup. Non-fatal."""
+        if not self._snapshot_service or not self._session_factory:
+            return
+        session = self._session_factory()
+        try:
+            await self._snapshot_service.run_retention(session)
+        except Exception as e:
+            logger.debug("paper.snapshot_retention_error", error=str(e)[:100])
         finally:
             await session.close()
 

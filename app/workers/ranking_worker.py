@@ -51,6 +51,9 @@ class RankingWorker(ConsumerWorker):
         self._last_rank_batch: datetime | None = None
         self._last_retention_run: datetime | None = None
         self._paper_worker: Any = None
+        # Price snapshot integration
+        self._snapshot_service: Any = None
+        self._last_ranked_snapshot: datetime | None = None
 
     async def process(self, envelope: EventEnvelope) -> None:
         """Process prediction and generate rankings."""
@@ -202,6 +205,7 @@ class RankingWorker(ConsumerWorker):
                         metadata_json->>'regime' as regime,
                         metadata_json->>'stage' as stage,
                         metadata_json->>'cluster_id' as cluster_id,
+                        metadata_json->'signals' as signals_json,
                         created_at
                     FROM predictions
                     WHERE created_at >= :window_start
@@ -238,7 +242,17 @@ class RankingWorker(ConsumerWorker):
                 score = float(row[2]) if row[2] else 0
                 regime = row[4] or "NORMAL"
                 stage = row[5] or "EARLY_STAGE"
-                batch_rank = int(row[8]) if row[8] else 0
+                signals_raw = row[7]  # metadata_json->'signals' from prediction
+                batch_rank = int(row[9]) if row[9] else 0
+
+                # Parse signals from prediction
+                pred_signals = None
+                if signals_raw:
+                    try:
+                        import json as _json
+                        pred_signals = _json.loads(signals_raw) if isinstance(signals_raw, str) else signals_raw
+                    except Exception:
+                        pred_signals = None
 
                 if not pred_id:
                     continue
@@ -254,6 +268,9 @@ class RankingWorker(ConsumerWorker):
                 if existing:
                     existing.rank = batch_rank
                     existing.ranking_window = window_id
+                    # Preserve signals from prediction if existing has none
+                    if pred_signals and not existing.signals_json:
+                        existing.signals_json = pred_signals
                     updated += 1
                 else:
                     # Create ranking record from prediction
@@ -268,7 +285,7 @@ class RankingWorker(ConsumerWorker):
                         alpha_score=score,
                         is_leader=False,
                         confidence=0,
-                        signals_json=None,
+                        signals_json=pred_signals,
                         metadata_json={"batch_ranked": True},
                         ranking_window=window_id,
                         created_at=now,
@@ -286,6 +303,15 @@ class RankingWorker(ConsumerWorker):
                 top_token=rows[0][1] if rows else "",
                 top_score=float(rows[0][2]) if rows and rows[0][2] else 0,
             )
+
+            # Capture price snapshots for ranked tokens (non-fatal)
+            if self._should_ranked_snapshot(now):
+                ranked_tokens = [
+                    {"token_mint": row[1], "score": float(row[2]) if row[2] else 0, "rank": int(row[9]) if row[9] else 0}
+                    for row in rows
+                ]
+                await self._capture_ranked_token_snapshots(ranked_tokens, now)
+                self._last_ranked_snapshot = now
 
         except Exception as e:
             await session.rollback()
@@ -397,6 +423,48 @@ class RankingWorker(ConsumerWorker):
                 "ranking_worker.retention_error",
                 error=str(e),
             )
+        finally:
+            await session.close()
+
+    # ── Price Snapshot Helpers ─────────────────────────────
+
+    def _should_ranked_snapshot(self, now: datetime) -> bool:
+        """Check if it's time for ranked token snapshots."""
+        if self._last_ranked_snapshot is None:
+            return True
+        interval = timedelta(seconds=settings.PRICE_SNAPSHOT_INTERVAL_SECONDS)
+        return (now - self._last_ranked_snapshot) >= interval
+
+    async def _capture_ranked_token_snapshots(
+        self, ranked_tokens: list[dict[str, Any]], now: datetime
+    ) -> None:
+        """Capture price snapshots for top-ranked tokens. Non-fatal."""
+        # Lazy initialization of snapshot service
+        if self._snapshot_service is None and settings.PRICE_SNAPSHOT_ENABLED:
+            try:
+                from redis.asyncio import Redis
+                from app.analytics.pricing_service import PricingService
+                from app.analytics.price_snapshot_service import PriceSnapshotService
+                from app.infrastructure.external.jupiter_client import JupiterPriceClient
+                from app.infrastructure.redis.price_cache import TokenPriceCache
+                redis = Redis.from_url(settings.REDIS_CACHE_URL, decode_responses=True)
+                jupiter = JupiterPriceClient()
+                cache = TokenPriceCache(redis)
+                pricing = PricingService(jupiter, cache)
+                self._snapshot_service = PriceSnapshotService(pricing)
+                logger.info("ranking.snapshot_service_initialized")
+            except Exception as e:
+                logger.warning("ranking.snapshot_init_failed", error=str(e)[:200])
+                self._snapshot_service = False  # Sentinel: don't retry
+
+        if not self._snapshot_service or self._snapshot_service is False:
+            return
+
+        session = self._session_factory()
+        try:
+            await self._snapshot_service.capture_for_ranked_tokens(session, ranked_tokens)
+        except Exception as e:
+            logger.warning("ranking.snapshot_error", error=str(e)[:200])
         finally:
             await session.close()
 
