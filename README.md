@@ -75,6 +75,28 @@ Virtual position simulation for evaluating prediction signals without real capit
 - **Safety:** `PAPER_TRADING_DRY_RUN=true` by default — creates SKIPPED records only, never OPEN positions
 - **Token activity filter:** validates recent trading activity before entry
 - **Exit rules:** +20% TP1, +50% TP2, -10% SL, 24h timeout
+- **Trailing stop:** activates at +3% ROI, triggers on 2% drop from peak
+- **Parabolic timeout:** 6h max hold for PARABOLIC regime tokens
+
+### Trade Gatekeeper
+
+Multi-layer entry filter before paper position creation:
+
+1. **Stablecoin exclusion** — USDC, USDT, wSOL skipped
+2. **Duplicate token guard** — prevents multiple positions on same token
+3. **Token activity filter** — requires minimum events and unique wallets within time window
+4. **Token momentum filter** — continuous activity-based signal (not binary)
+5. **Whale concentration filter** — rejects tokens with top wallet holding >70%
+6. **Price availability** — requires valid Jupiter V3 price quote
+
+### Post-Mortem Risk Rules
+
+After each closed trade, the system applies lessons learned:
+
+- **Parabolic entry confirmation** — requires `token_momentum >= 0.30` for PARABOLIC/HIGH_PUMP_RISK tokens
+- **Whale concentration guard** — rejects tokens where top wallet holds >70% of tracked supply
+- **Trailing stop** — locks in profits after +3% gain (2% drop trigger)
+- **Parabolic timeout** — 6h max hold instead of 24h for parabolic tokens
 
 ```
 GET /api/v1/paper/status
@@ -161,6 +183,22 @@ docker compose up -d api worker
 # Run migrations
 docker compose exec api alembic upgrade head
 ```
+
+## Research Roadmap
+
+This project is an evolving research infrastructure. Long-term model design and research notes are tracked in the Notion research roadmap:
+
+**[Solana Wallet Intelligence — Long-Term Model Roadmap](https://app.notion.com/p/Solana-Wallet-Intelligence-Long-Term-Model-Roadmap-e9eb8655a6854c0088757a8dc9b98ce0)**
+
+### Planned Research Areas
+
+- **Trade Gatekeeper** — multi-layer entry filtering with activity, momentum, concentration, and liquidity signals. Currently in paper trading dry-run validation.
+
+- **Exit & Position Manager** — trailing stops, regime-aware timeouts, dynamic position sizing, portfolio-level risk management. Trailing stop and parabolic timeout active in paper trading.
+
+- **Social Intelligence Layer** — future integration of social sentiment, Twitter/Telegram signal correlation, influencer wallet tracking, and narrative detection as additional alpha signals.
+
+These are research directions, not production features. All experiments run in paper trading dry-run mode before any evaluation of real behavior.
 
 ## Safety Notice
 
