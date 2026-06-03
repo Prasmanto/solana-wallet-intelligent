@@ -13,6 +13,7 @@ from app.infrastructure.database.session import Base
 
 # Import all models so Alembic can detect them
 from app.infrastructure.database.models import RawEvent  # noqa: F401
+from app.infrastructure.database.models.token_price_snapshot import TokenPriceSnapshot  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)

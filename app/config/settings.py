@@ -132,6 +132,13 @@ class Settings(BaseSettings):
     PAPER_MIN_TOKEN_EVENTS_15M: int = 10
     PAPER_MIN_UNIQUE_WALLETS_15M: int = 5
 
+    # ── Price Snapshots ────────────────────────────────────
+    PRICE_SNAPSHOT_ENABLED: bool = True
+    PRICE_SNAPSHOT_INTERVAL_SECONDS: int = 300  # 5 min
+    PRICE_SNAPSHOT_RETENTION_DAYS: int = 7
+    PRICE_SNAPSHOT_TOP_RANKED_LIMIT: int = 50
+    PRICE_SNAPSHOT_DEDUP_WINDOW_SECONDS: int = 120
+
     # ── Jupiter Price API ──────────────────────────────────
     JUPITER_PRICE_BASE_URL: str = "https://lite-api.jup.ag/price/v3"
 

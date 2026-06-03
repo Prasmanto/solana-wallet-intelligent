@@ -50,8 +50,10 @@ class PaperTradingWorker:
     def __init__(self, session_factory: Any = None) -> None:
         self._session_factory = session_factory
         self._pricing: Any = None
+        self._snapshot_service: Any = None
         self._running = False
         self._last_snapshot: datetime | None = None
+        self._last_price_snapshot: datetime | None = None
         self._cycle_count = 0
         # Price feed stats
         self._price_success_count = 0
@@ -90,6 +92,7 @@ class PaperTradingWorker:
             from redis.asyncio import Redis
 
             from app.analytics.pricing_service import PricingService
+            from app.analytics.price_snapshot_service import PriceSnapshotService
             from app.infrastructure.external.jupiter_client import (
                 JupiterPriceClient,
             )
@@ -99,6 +102,11 @@ class PaperTradingWorker:
             jupiter = JupiterPriceClient()
             cache = TokenPriceCache(redis)
             self._pricing = PricingService(jupiter, cache)
+
+            if settings.PRICE_SNAPSHOT_ENABLED:
+                self._snapshot_service = PriceSnapshotService(self._pricing)
+                logger.info("paper_worker.snapshot_service_initialized")
+
             logger.info("paper_worker.pricing_initialized")
         except Exception as e:
             logger.warning("paper_worker.pricing_init_failed", error=str(e))
@@ -111,7 +119,12 @@ class PaperTradingWorker:
         # 1. Monitor OPEN positions (price refresh + exit check)
         await self._monitor_positions()
 
-        # 2. Periodic portfolio snapshot
+        # 2. Periodic price snapshot capture
+        if self._should_price_snapshot(now):
+            await self._take_price_snapshot(now)
+            self._last_price_snapshot = now
+
+        # 3. Periodic portfolio snapshot
         if self._should_snapshot(now):
             await self._take_snapshot(now)
             self._last_snapshot = now
@@ -196,6 +209,9 @@ class PaperTradingWorker:
                 candidate=candidate,
             )
             return
+
+        # Capture price snapshot for this candidate (non-blocking)
+        await self._capture_candidate_snapshot(token, candidate)
 
         # Create OPEN position in DB
         await self._persist_open_position(
@@ -536,6 +552,89 @@ class PaperTradingWorker:
             self._price_failure_count += 1
             logger.warning("paper.price_fetch_error", token=token_mint[:16], error=str(e)[:100])
         return None
+
+    # ── Price Snapshot Capture ──────────────────────────────
+
+    async def _capture_candidate_snapshot(
+        self, token: str, candidate: dict[str, Any]
+    ) -> None:
+        """Capture price snapshot for a paper candidate (non-blocking).
+
+        Failures are logged and swallowed — never crashes the worker.
+        """
+        if not self._snapshot_service or not self._session_factory:
+            return
+
+        session = self._session_factory()
+        try:
+            await self._snapshot_service.capture_for_paper_candidate(
+                session,
+                token,
+                candidate_metadata={
+                    "score": candidate.get("score", 0),
+                    "rank": candidate.get("rank", 0),
+                    "regime": candidate.get("regime", ""),
+                    "stage": candidate.get("stage", ""),
+                },
+            )
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            logger.debug(
+                "paper.snapshot_capture_error",
+                token=token[:16],
+                error=str(e)[:100],
+            )
+        finally:
+            await session.close()
+
+    def _should_price_snapshot(self, now: datetime) -> bool:
+        """Check if it's time for a periodic price snapshot."""
+        if not settings.PRICE_SNAPSHOT_ENABLED:
+            return False
+        if self._last_price_snapshot is None:
+            return True
+        interval = timedelta(seconds=settings.PRICE_SNAPSHOT_INTERVAL_SECONDS)
+        return (now - self._last_price_snapshot) >= interval
+
+    async def _take_price_snapshot(self, now: datetime) -> None:
+        """Capture price snapshots for all OPEN positions.
+
+        Also runs retention cleanup. Failures are non-fatal.
+        """
+        if not self._snapshot_service or not self._session_factory:
+            return
+
+        session = self._session_factory()
+        try:
+            # Get unique token mints from OPEN positions
+            stmt = (
+                select(PaperPosition.token_mint)
+                .where(PaperPosition.status == "OPEN")
+                .distinct()
+            )
+            result = await session.execute(stmt)
+            open_mints = [row[0] for row in result.fetchall()]
+
+            if open_mints:
+                await self._snapshot_service.capture_for_open_positions(
+                    session, open_mints
+                )
+
+            # Run retention cleanup
+            await self._snapshot_service.run_retention(session)
+
+            await session.commit()
+
+            logger.debug(
+                "paper.price_snapshot_done",
+                tokens=len(open_mints),
+            )
+        except Exception as e:
+            await session.rollback()
+            logger.error("paper.price_snapshot_error", error=str(e)[:200])
+        finally:
+            await session.close()
 
     # ── DB Persistence ──────────────────────────────────────
 

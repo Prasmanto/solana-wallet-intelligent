@@ -51,6 +51,8 @@ class RankingWorker(ConsumerWorker):
         self._last_rank_batch: datetime | None = None
         self._last_retention_run: datetime | None = None
         self._paper_worker: Any = None
+        self._snapshot_service: Any = None
+        self._last_ranked_tokens: list[dict[str, Any]] = []
 
     async def process(self, envelope: EventEnvelope) -> None:
         """Process prediction and generate rankings."""
@@ -165,6 +167,7 @@ class RankingWorker(ConsumerWorker):
         now = datetime.now(timezone.utc)
         if self._should_run_batch_ranks(now):
             await self._compute_batch_ranks(now)
+            await self._capture_ranked_token_snapshots(now)
             await self._emit_paper_candidates()
             self._last_rank_batch = now
 
@@ -231,6 +234,7 @@ class RankingWorker(ConsumerWorker):
 
             # Update existing rankings for this window with computed ranks
             updated = 0
+            ranked_tokens: list[dict[str, Any]] = []
             for row in rows:
                 # Find existing ranking for this prediction_id in this window
                 pred_id = row[0] if row[0] else None
@@ -276,7 +280,19 @@ class RankingWorker(ConsumerWorker):
                     session.add(ranking_record)
                     updated += 1
 
+                # Track for snapshot capture
+                ranked_tokens.append({
+                    "token_mint": token,
+                    "score": score,
+                    "rank": batch_rank,
+                    "regime": regime,
+                    "stage": stage,
+                })
+
             await session.commit()
+
+            # Store for snapshot capture
+            self._last_ranked_tokens = ranked_tokens
 
             logger.info(
                 "ranking_worker.batch_ranks_done",
@@ -293,6 +309,53 @@ class RankingWorker(ConsumerWorker):
                 "ranking_worker.batch_ranks_error",
                 error=str(e),
             )
+        finally:
+            await session.close()
+
+    async def _capture_ranked_token_snapshots(self, now: datetime) -> None:
+        """Capture price snapshots for top-ranked tokens.
+
+        Called after batch rank computation. Failures are non-fatal.
+        """
+        if not settings.PRICE_SNAPSHOT_ENABLED:
+            return
+
+        if not self._last_ranked_tokens:
+            return
+
+        # Lazy init snapshot service
+        if self._snapshot_service is None:
+            try:
+                from redis.asyncio import Redis
+
+                from app.analytics.pricing_service import PricingService
+                from app.analytics.price_snapshot_service import PriceSnapshotService
+                from app.infrastructure.external.jupiter_client import JupiterPriceClient
+                from app.infrastructure.redis.price_cache import TokenPriceCache
+
+                redis = Redis.from_url(settings.REDIS_CACHE_URL, decode_responses=True)
+                jupiter = JupiterPriceClient()
+                cache = TokenPriceCache(redis)
+                pricing = PricingService(jupiter, cache)
+                self._snapshot_service = PriceSnapshotService(pricing)
+                logger.info("ranking_worker.snapshot_service_initialized")
+            except Exception as e:
+                logger.warning("ranking_worker.snapshot_init_failed", error=str(e)[:100])
+                return
+
+        session = self.get_session()
+        try:
+            await self._snapshot_service.capture_for_ranked_tokens(
+                session, self._last_ranked_tokens
+            )
+            await session.commit()
+            logger.debug(
+                "ranking_worker.snapshots_captured",
+                tokens=len(self._last_ranked_tokens),
+            )
+        except Exception as e:
+            await session.rollback()
+            logger.error("ranking_worker.snapshot_error", error=str(e)[:200])
         finally:
             await session.close()
 
