@@ -98,7 +98,8 @@ async def paper_status() -> dict[str, Any]:
             meta = pos.metadata_json or {}
             reason = meta.get("skip_reason", "unknown")
             activity = meta.get("token_activity", {})
-            candidates.append({
+            entry_timing = meta.get("entry_timing")
+            candidate_data = {
                 "token": pos.token_mint,
                 "score": pos.entry_score,
                 "rank": meta.get("rank", 0),
@@ -110,7 +111,10 @@ async def paper_status() -> dict[str, Any]:
                 "last_token_activity_age_minutes": activity.get("last_activity_age_minutes", -1),
                 "activity_filter_passed": activity.get("passed", None),
                 "created_at": pos.created_at.isoformat() if pos.created_at else "",
-            })
+            }
+            if entry_timing:
+                candidate_data["entry_timing"] = entry_timing
+            candidates.append(candidate_data)
             skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
 
         # Latest OPEN positions (for visibility)

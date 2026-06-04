@@ -129,11 +129,21 @@ class Settings(BaseSettings):
         ],
     )
     PAPER_MAX_TOKEN_ACTIVITY_AGE_MINUTES: int = 30
-    PAPER_MIN_TOKEN_EVENTS_15M: int = 10
-    PAPER_MIN_UNIQUE_WALLETS_15M: int = 5
+    PAPER_MIN_TOKEN_EVENTS_15M: int = 3
+    PAPER_MIN_UNIQUE_WALLETS_15M: int = 2
 
-    # ── Jupiter Price API ──────────────────────────────────
-    JUPITER_PRICE_BASE_URL: str = "https://lite-api.jup.ag/price/v3"
+    # ── Parabolic Entry Filters ─────────────────────────────
+    PAPER_PARABOLIC_MIN_MOMENTUM: float = 0.30
+    PAPER_PARABOLIC_MIN_SMART_MONEY: float = 0.10
+    PAPER_MAX_TOP_WALLET_CONCENTRATION: float = 0.70
+
+    # ── Entry Timing Filters ────────────────────────────────
+    PAPER_ENTRY_TIMING_ENABLED: bool = True
+    PAPER_ENTRY_TIMING_MIN_HISTORY_MINUTES: int = 60
+    PAPER_LATE_ENTRY_MAX_DISTANCE_FROM_LOW_PCT: float = 0.25
+    PAPER_CHASING_PUMP_WAIT_CHANGE_15M_PCT: float = 0.20
+    PAPER_CHASING_PUMP_WAIT_CHANGE_30M_PCT: float = 0.30
+    PAPER_ENTRY_TIMING_BLOCK_ON_INSUFFICIENT_HISTORY: bool = False
 
     # ── Price Snapshots ────────────────────────────────────
     PRICE_SNAPSHOT_ENABLED: bool = True
@@ -141,6 +151,17 @@ class Settings(BaseSettings):
     PRICE_SNAPSHOT_RETENTION_DAYS: int = 7
     PRICE_SNAPSHOT_TOP_RANKED_LIMIT: int = 50
     PRICE_SNAPSHOT_DEDUP_WINDOW_SECONDS: int = 120
+
+    # ── Trailing Stop ────────────────────────────────────────
+    PAPER_TRAILING_STOP_ENABLED: bool = True
+    PAPER_TRAILING_STOP_ACTIVATION_ROI: float = 3.0
+    PAPER_TRAILING_STOP_DROP_ROI: float = 2.0
+
+    # ── Parabolic Max Hold ───────────────────────────────────
+    PAPER_PARABOLIC_MAX_HOLD_HOURS: int = 6
+
+    # ── Jupiter Price API ──────────────────────────────────
+    JUPITER_PRICE_BASE_URL: str = "https://lite-api.jup.ag/price/v3"
 
     # ── Redis Streams Retention ────────────────────────────
     REDIS_STREAM_MAXLEN: int = 10000

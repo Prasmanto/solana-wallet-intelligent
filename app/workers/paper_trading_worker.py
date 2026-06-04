@@ -153,19 +153,28 @@ class PaperTradingWorker:
             return
 
         # Guard: dry-run mode — record SKIPPED, never create OPEN position
+        # Still runs entry timing analysis for audit visibility
         if not settings.PAPER_TRADING_ENABLED or settings.PAPER_TRADING_DRY_RUN:
+            entry_price = await self._fetch_price(token)
+            timing_result: dict[str, Any] = {"passed": True, "skip_reason": "", "metrics": None, "warnings": []}
+            if entry_price and entry_price > 0:
+                timing_result = await self._check_entry_timing(token, entry_price)
+            skip_reason = timing_result["skip_reason"] if not timing_result["passed"] else "dry_run_mode"
+            timing_data = {"entry_timing": timing_result["metrics"], "warnings": timing_result["warnings"]} if timing_result["metrics"] else None
             await self._persist_skipped(
                 token=token,
                 score=score,
                 rank=rank,
-                reason="dry_run_mode",
+                reason=skip_reason,
                 candidate=candidate,
+                activity_data=timing_data,
             )
             logger.info(
                 "paper.candidate_dry_run",
                 token=token[:16],
                 score=score,
                 rank=rank,
+                skip_reason=skip_reason,
             )
             return
 
@@ -267,6 +276,19 @@ class PaperTradingWorker:
             )
             return
 
+        # Guard: entry timing analysis (late entry / chasing pump detection)
+        timing_result = await self._check_entry_timing(token, entry_price)
+        if not timing_result["passed"]:
+            await self._persist_skipped(
+                token=token,
+                score=score,
+                rank=rank,
+                reason=timing_result["skip_reason"],
+                candidate=candidate,
+                activity_data={"entry_timing": timing_result["metrics"], "warnings": timing_result["warnings"]},
+            )
+            return
+
         # Capture price snapshot for candidate (non-fatal, best-effort)
         await self._capture_candidate_snapshot(token, candidate)
 
@@ -277,6 +299,7 @@ class PaperTradingWorker:
             rank=rank,
             entry_price=entry_price,
             candidate=candidate,
+            entry_timing=timing_result["metrics"],
         )
 
     # ── Position Monitoring ─────────────────────────────────
@@ -738,6 +761,7 @@ class PaperTradingWorker:
         rank: int,
         entry_price: float,
         candidate: dict[str, Any],
+        entry_timing: dict[str, Any] | None = None,
     ) -> None:
         """Persist an OPEN paper position."""
         if not self._session_factory:
@@ -748,6 +772,23 @@ class PaperTradingWorker:
 
         session = self._session_factory()
         try:
+            metadata = {
+                "rank": rank,
+                "regime": candidate.get("regime", ""),
+                "stage": candidate.get("stage", ""),
+                "alpha_score": candidate.get("alpha_score", 0),
+                "confidence": candidate.get("confidence", 0),
+                "signals": candidate.get("signals", {}),
+                "momentum": (candidate.get("signals", {}) or {}).get("token_momentum", 0) or (candidate.get("signals", {}) or {}).get("momentum", 0),
+                "token_momentum": (candidate.get("signals", {}) or {}).get("token_momentum", 0),
+                "wallet_quality_momentum": (candidate.get("signals", {}) or {}).get("wallet_quality_momentum", 0),
+                "smart_money": (candidate.get("signals", {}) or {}).get("smart_money", 0),
+                "trailing_stop_active": False,
+                "trailing_stop_level": 0,
+            }
+            if entry_timing:
+                metadata["entry_timing"] = entry_timing
+
             record = PaperPosition(
                 id=uuid.uuid4(),
                 token_mint=token,
@@ -756,20 +797,7 @@ class PaperTradingWorker:
                 virtual_size_usd=round(position_size_usd, 2),
                 status="OPEN",
                 opened_at=datetime.now(timezone.utc),
-                metadata_json={
-                    "rank": rank,
-                    "regime": candidate.get("regime", ""),
-                    "stage": candidate.get("stage", ""),
-                    "alpha_score": candidate.get("alpha_score", 0),
-                    "confidence": candidate.get("confidence", 0),
-                    "signals": candidate.get("signals", {}),
-                    "momentum": (candidate.get("signals", {}) or {}).get("token_momentum", 0) or (candidate.get("signals", {}) or {}).get("momentum", 0),
-                    "token_momentum": (candidate.get("signals", {}) or {}).get("token_momentum", 0),
-                    "wallet_quality_momentum": (candidate.get("signals", {}) or {}).get("wallet_quality_momentum", 0),
-                    "smart_money": (candidate.get("signals", {}) or {}).get("smart_money", 0),
-                    "trailing_stop_active": False,
-                    "trailing_stop_level": 0,
-                },
+                metadata_json=metadata,
             )
             session.add(record)
             await session.commit()
@@ -909,6 +937,103 @@ class PaperTradingWorker:
             logger.debug("paper.snapshot_candidate_error", token=token[:16], error=str(e)[:100])
         finally:
             await session.close()
+
+    async def _check_entry_timing(
+        self, token: str, entry_price: float
+    ) -> dict[str, Any]:
+        """Check entry timing using price snapshot history.
+
+        Returns:
+            dict with keys: passed, skip_reason, metrics (dict), warnings (list)
+        """
+        result: dict[str, Any] = {
+            "passed": True,
+            "skip_reason": "",
+            "metrics": None,
+            "warnings": [],
+        }
+
+        if not settings.PAPER_ENTRY_TIMING_ENABLED:
+            return result
+
+        if not self._session_factory:
+            return result
+
+        session = self._session_factory()
+        try:
+            from app.analytics.entry_timing import EntryTimingAnalyzer
+
+            analyzer = EntryTimingAnalyzer(session)
+            metrics = await analyzer.compute(
+                token_mint=token,
+                entry_time=datetime.now(timezone.utc),
+                entry_price=entry_price,
+            )
+            result["metrics"] = metrics.to_dict()
+
+            # Rule 1: insufficient history
+            if metrics.data_quality == "insufficient_history":
+                result["warnings"].append("insufficient_entry_timing_history")
+                if settings.PAPER_ENTRY_TIMING_BLOCK_ON_INSUFFICIENT_HISTORY:
+                    result["passed"] = False
+                    result["skip_reason"] = "insufficient_entry_timing_history"
+                logger.info(
+                    "paper.entry_timing_insufficient",
+                    token=token[:16],
+                    data_quality=metrics.data_quality,
+                )
+                return result
+
+            # Rule 2: late entry — too far from local low
+            dist = metrics.entry_distance_from_local_low_pct
+            if dist is not None and dist >= settings.PAPER_LATE_ENTRY_MAX_DISTANCE_FROM_LOW_PCT:
+                result["passed"] = False
+                result["skip_reason"] = "late_entry_risk"
+                result["warnings"].append("late_entry_risk")
+                logger.info(
+                    "paper.entry_timing_late_entry",
+                    token=token[:16],
+                    distance_from_low=dist,
+                    threshold=settings.PAPER_LATE_ENTRY_MAX_DISTANCE_FROM_LOW_PCT,
+                )
+                return result
+
+            # Rule 3: chasing pump — 15m change too high
+            change_15m = metrics.price_change_15m_pct
+            if change_15m is not None and change_15m >= settings.PAPER_CHASING_PUMP_WAIT_CHANGE_15M_PCT:
+                result["passed"] = False
+                result["skip_reason"] = "chasing_pump_risk_15m"
+                result["warnings"].append("chasing_pump_risk")
+                logger.info(
+                    "paper.entry_timing_chasing_15m",
+                    token=token[:16],
+                    change_15m=change_15m,
+                    threshold=settings.PAPER_CHASING_PUMP_WAIT_CHANGE_15M_PCT,
+                )
+                return result
+
+            # Rule 4: chasing pump — 30m change too high
+            change_30m = metrics.price_change_30m_pct
+            if change_30m is not None and change_30m >= settings.PAPER_CHASING_PUMP_WAIT_CHANGE_30M_PCT:
+                result["passed"] = False
+                result["skip_reason"] = "chasing_pump_risk_30m"
+                result["warnings"].append("chasing_pump_risk")
+                logger.info(
+                    "paper.entry_timing_chasing_30m",
+                    token=token[:16],
+                    change_30m=change_30m,
+                    threshold=settings.PAPER_CHASING_PUMP_WAIT_CHANGE_30M_PCT,
+                )
+                return result
+
+        except Exception as e:
+            # Entry timing failure must never crash the worker
+            result["warnings"].append(f"entry_timing_error:{type(e).__name__}")
+            logger.warning("paper.entry_timing_error", token=token[:16], error=str(e)[:200])
+        finally:
+            await session.close()
+
+        return result
 
     async def _capture_open_position_snapshots(self) -> None:
         """Capture price snapshots for all open positions. Non-fatal."""

@@ -239,3 +239,267 @@ class TestPositionLifecycle:
         assert status["skipped_positions"] == 0
         assert status["latest_candidates"] == []
         assert status["portfolio_value"] == 0
+
+
+# ── Entry Timing Integration Tests ──────────────────────────
+
+
+class TestEntryTimingIntegration:
+    """Test entry timing filter integration in PaperTradingWorker."""
+
+    @pytest.mark.asyncio
+    async def test_insufficient_history_does_not_block(self) -> None:
+        """When BLOCK_ON_INSUFFICIENT_HISTORY=false, insufficient history should pass."""
+        from app.analytics.entry_timing import EntryTimingMetrics
+        from app.workers.paper_trading_worker import PaperTradingWorker
+
+        worker = PaperTradingWorker(session_factory=MagicMock())
+
+        metrics = EntryTimingMetrics(
+            token_mint="TestToken",
+            entry_time=datetime.now(timezone.utc),
+            entry_price=1.0,
+            price_5m_before=None,
+            price_15m_before=None,
+            price_30m_before=None,
+            price_60m_before=None,
+            local_low_60m=None,
+            entry_distance_from_local_low_pct=None,
+            price_change_15m_pct=None,
+            price_change_30m_pct=None,
+            price_change_60m_pct=None,
+            data_quality="insufficient_history",
+        )
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = []
+        mock_session.execute.return_value = mock_result
+
+        mock_session_factory = MagicMock(return_value=mock_session)
+
+        with patch.object(settings, "PAPER_ENTRY_TIMING_ENABLED", True), \
+             patch.object(settings, "PAPER_ENTRY_TIMING_BLOCK_ON_INSUFFICIENT_HISTORY", False):
+
+            with patch("app.analytics.entry_timing.EntryTimingAnalyzer") as MockAnalyzer:
+                instance = MockAnalyzer.return_value
+                instance.compute = AsyncMock(return_value=metrics)
+
+                worker._session_factory = mock_session_factory
+                result = await worker._check_entry_timing("TestToken11111111111111111111111111111111", 1.0)
+
+        assert result["passed"] is True
+        assert result["skip_reason"] == ""
+        assert "insufficient_entry_timing_history" in result["warnings"]
+
+    @pytest.mark.asyncio
+    async def test_distance_from_low_blocks(self) -> None:
+        """When distance_from_local_low >= threshold, should block."""
+        from app.analytics.entry_timing import EntryTimingMetrics
+        from app.workers.paper_trading_worker import PaperTradingWorker
+
+        worker = PaperTradingWorker(session_factory=MagicMock())
+
+        metrics = EntryTimingMetrics(
+            token_mint="TestToken",
+            entry_time=datetime.now(timezone.utc),
+            entry_price=1.30,
+            price_5m_before=1.25,
+            price_15m_before=1.10,
+            price_30m_before=1.05,
+            price_60m_before=1.0,
+            local_low_60m=1.0,
+            entry_distance_from_local_low_pct=30.0,
+            price_change_15m_pct=18.18,
+            price_change_30m_pct=23.81,
+            price_change_60m_pct=30.0,
+            data_quality="sufficient_history",
+        )
+
+        mock_session_factory = MagicMock()
+        mock_session = AsyncMock()
+        mock_session_factory.return_value = mock_session
+
+        with patch.object(settings, "PAPER_ENTRY_TIMING_ENABLED", True), \
+             patch.object(settings, "PAPER_LATE_ENTRY_MAX_DISTANCE_FROM_LOW_PCT", 0.25):
+
+            with patch("app.analytics.entry_timing.EntryTimingAnalyzer") as MockAnalyzer:
+                instance = MockAnalyzer.return_value
+                instance.compute = AsyncMock(return_value=metrics)
+
+                worker._session_factory = mock_session_factory
+                result = await worker._check_entry_timing("TestToken11111111111111111111111111111111", 1.30)
+
+        assert result["passed"] is False
+        assert result["skip_reason"] == "late_entry_risk"
+
+    @pytest.mark.asyncio
+    async def test_chasing_pump_15m_blocks(self) -> None:
+        """When price_change_15m >= threshold, should block."""
+        from app.analytics.entry_timing import EntryTimingMetrics
+        from app.workers.paper_trading_worker import PaperTradingWorker
+
+        worker = PaperTradingWorker(session_factory=MagicMock())
+
+        metrics = EntryTimingMetrics(
+            token_mint="TestToken",
+            entry_time=datetime.now(timezone.utc),
+            entry_price=1.05,
+            price_5m_before=1.02,
+            price_15m_before=0.84,
+            price_30m_before=0.82,
+            price_60m_before=0.80,
+            local_low_60m=0.80,
+            entry_distance_from_local_low_pct=0.20,
+            price_change_15m_pct=25.0,
+            price_change_30m_pct=28.05,
+            price_change_60m_pct=31.25,
+            data_quality="sufficient_history",
+        )
+
+        mock_session_factory = MagicMock()
+        mock_session = AsyncMock()
+        mock_session_factory.return_value = mock_session
+
+        with patch.object(settings, "PAPER_ENTRY_TIMING_ENABLED", True), \
+             patch.object(settings, "PAPER_LATE_ENTRY_MAX_DISTANCE_FROM_LOW_PCT", 25.0), \
+             patch.object(settings, "PAPER_CHASING_PUMP_WAIT_CHANGE_15M_PCT", 0.20):
+
+            with patch("app.analytics.entry_timing.EntryTimingAnalyzer") as MockAnalyzer:
+                instance = MockAnalyzer.return_value
+                instance.compute = AsyncMock(return_value=metrics)
+
+                worker._session_factory = mock_session_factory
+                result = await worker._check_entry_timing("TestToken11111111111111111111111111111111", 1.05)
+
+        assert result["passed"] is False
+        assert result["skip_reason"] == "chasing_pump_risk_15m"
+
+    @pytest.mark.asyncio
+    async def test_chasing_pump_30m_blocks(self) -> None:
+        """When price_change_30m >= threshold, should block."""
+        from app.analytics.entry_timing import EntryTimingMetrics
+        from app.workers.paper_trading_worker import PaperTradingWorker
+
+        worker = PaperTradingWorker(session_factory=MagicMock())
+
+        metrics = EntryTimingMetrics(
+            token_mint="TestToken",
+            entry_time=datetime.now(timezone.utc),
+            entry_price=1.10,
+            price_5m_before=1.08,
+            price_15m_before=1.05,
+            price_30m_before=0.80,
+            price_60m_before=0.78,
+            local_low_60m=0.78,
+            entry_distance_from_local_low_pct=0.20,
+            price_change_15m_pct=4.76,
+            price_change_30m_pct=37.5,
+            price_change_60m_pct=41.03,
+            data_quality="sufficient_history",
+        )
+
+        mock_session_factory = MagicMock()
+        mock_session = AsyncMock()
+        mock_session_factory.return_value = mock_session
+
+        with patch.object(settings, "PAPER_ENTRY_TIMING_ENABLED", True), \
+             patch.object(settings, "PAPER_LATE_ENTRY_MAX_DISTANCE_FROM_LOW_PCT", 25.0), \
+             patch.object(settings, "PAPER_CHASING_PUMP_WAIT_CHANGE_15M_PCT", 20.0), \
+             patch.object(settings, "PAPER_CHASING_PUMP_WAIT_CHANGE_30M_PCT", 0.30):
+
+            with patch("app.analytics.entry_timing.EntryTimingAnalyzer") as MockAnalyzer:
+                instance = MockAnalyzer.return_value
+                instance.compute = AsyncMock(return_value=metrics)
+
+                worker._session_factory = mock_session_factory
+                result = await worker._check_entry_timing("TestToken11111111111111111111111111111111", 1.10)
+
+        assert result["passed"] is False
+        assert result["skip_reason"] == "chasing_pump_risk_30m"
+
+    @pytest.mark.asyncio
+    async def test_timing_metrics_included_in_result(self) -> None:
+        """Entry timing metrics should be included in the result dict."""
+        from app.analytics.entry_timing import EntryTimingMetrics
+        from app.workers.paper_trading_worker import PaperTradingWorker
+
+        worker = PaperTradingWorker(session_factory=MagicMock())
+
+        metrics = EntryTimingMetrics(
+            token_mint="TestToken",
+            entry_time=datetime.now(timezone.utc),
+            entry_price=1.0,
+            price_5m_before=0.99,
+            price_15m_before=0.98,
+            price_30m_before=0.97,
+            price_60m_before=0.96,
+            local_low_60m=0.95,
+            entry_distance_from_local_low_pct=5.26,
+            price_change_15m_pct=2.04,
+            price_change_30m_pct=3.09,
+            price_change_60m_pct=4.17,
+            data_quality="sufficient_history",
+        )
+
+        mock_session_factory = MagicMock()
+        mock_session = AsyncMock()
+        mock_session_factory.return_value = mock_session
+
+        with patch.object(settings, "PAPER_ENTRY_TIMING_ENABLED", True), \
+             patch.object(settings, "PAPER_LATE_ENTRY_MAX_DISTANCE_FROM_LOW_PCT", 25.0), \
+             patch.object(settings, "PAPER_CHASING_PUMP_WAIT_CHANGE_15M_PCT", 20.0), \
+             patch.object(settings, "PAPER_CHASING_PUMP_WAIT_CHANGE_30M_PCT", 30.0):
+
+            with patch("app.analytics.entry_timing.EntryTimingAnalyzer") as MockAnalyzer:
+                instance = MockAnalyzer.return_value
+                instance.compute = AsyncMock(return_value=metrics)
+
+                worker._session_factory = mock_session_factory
+                result = await worker._check_entry_timing("TestToken11111111111111111111111111111111", 1.0)
+
+        assert result["passed"] is True
+        assert result["metrics"] is not None
+        assert result["metrics"]["entry_price"] == 1.0
+        assert result["metrics"]["local_low_60m"] == 0.95
+        assert result["metrics"]["price_change_15m_pct"] == 2.04
+        assert result["metrics"]["data_quality"] == "sufficient_history"
+
+    @pytest.mark.asyncio
+    async def test_entry_timing_error_does_not_crash(self) -> None:
+        """EntryTimingAnalyzer failure should not crash the worker."""
+        from app.workers.paper_trading_worker import PaperTradingWorker
+
+        worker = PaperTradingWorker(session_factory=MagicMock())
+
+        mock_session_factory = MagicMock()
+        mock_session = AsyncMock()
+        mock_session_factory.return_value = mock_session
+
+        with patch.object(settings, "PAPER_ENTRY_TIMING_ENABLED", True):
+
+            with patch("app.analytics.entry_timing.EntryTimingAnalyzer") as MockAnalyzer:
+                instance = MockAnalyzer.return_value
+                instance.compute = AsyncMock(side_effect=Exception("DB connection lost"))
+
+                worker._session_factory = mock_session_factory
+                result = await worker._check_entry_timing("TestToken11111111111111111111111111111111", 1.0)
+
+        # Should pass (non-blocking) and include error warning
+        assert result["passed"] is True
+        assert any("entry_timing_error" in w for w in result["warnings"])
+
+    @pytest.mark.asyncio
+    async def test_entry_timing_disabled_passes(self) -> None:
+        """When PAPER_ENTRY_TIMING_ENABLED=false, should always pass."""
+        from app.workers.paper_trading_worker import PaperTradingWorker
+
+        worker = PaperTradingWorker(session_factory=MagicMock())
+
+        with patch.object(settings, "PAPER_ENTRY_TIMING_ENABLED", False):
+            result = await worker._check_entry_timing("TestToken11111111111111111111111111111111", 1.0)
+
+        assert result["passed"] is True
+        assert result["metrics"] is None
