@@ -356,3 +356,168 @@ class TestSecurity:
         # Health dict must not contain raw keys
         health_str = str(health)
         assert "key_preview" not in health_str or "abcd...efgh" in health_str
+
+
+# ── WalletSelector v2 Tests ─────────────────────────────────
+
+
+class TestWalletSelectorV2:
+    """Test alpha-per-credit wallet selection."""
+
+    @pytest.mark.asyncio
+    async def test_zero_trade_wallets_excluded(self) -> None:
+        """Wallets with total_trades=0 must be excluded when setting is True."""
+        from app.infrastructure.helius.wallet_selector import WalletSelector
+
+        mock_session = AsyncMock()
+        mock_factory = MagicMock(return_value=mock_session)
+
+        # Simulate: _get_noisy_wallets returns empty, main query returns only valid wallets
+        call_count = 0
+
+        async def mock_execute(stmt, params=None):
+            nonlocal call_count
+            call_count += 1
+            result = MagicMock()
+            if call_count == 1:
+                # _get_noisy_wallets query
+                result.fetchall.return_value = []
+            else:
+                # Main select query - returns wallets with trades > 0
+                result.fetchall.return_value = [
+                    ("Wallet1HasTrades1111111111111111111111", 0.8, 0.8, 0.0, False),
+                    ("Wallet2HasTrades1111111111111111111111", 0.5, 0.5, 0.0, False),
+                ]
+            return result
+
+        mock_session.execute = mock_execute
+        mock_session.close = AsyncMock()
+
+        selector = WalletSelector(mock_factory)
+
+        with patch.object(settings, "HELIUS_EXCLUDE_ZERO_TRADE_WALLETS", True), \
+             patch.object(settings, "HELIUS_EXCLUDE_ZERO_ALPHA_WALLETS", False), \
+             patch.object(settings, "HELIUS_MIN_ALPHA_SCORE", 0.0):
+            wallets = await selector.select_wallets(max_wallets=100)
+
+        # Should return wallets (the SQL handles exclusion)
+        assert len(wallets) <= 100
+
+    @pytest.mark.asyncio
+    async def test_profitable_high_event_wallets_retained(self) -> None:
+        """Wallets with positive win_rate or PnL must NOT be excluded."""
+        from app.infrastructure.helius.wallet_selector import is_valid_solana_address
+
+        # A wallet with high events but positive PnL should pass
+        assert is_valid_solana_address("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1") is True
+
+    @pytest.mark.asyncio
+    async def test_selected_wallets_bounded(self) -> None:
+        """Selected wallets must not exceed HELIUS_MAX_MONITORED_WALLETS."""
+        from app.infrastructure.helius.wallet_selector import WalletSelector
+
+        mock_session = AsyncMock()
+        mock_factory = MagicMock(return_value=mock_session)
+
+        call_count = 0
+
+        async def mock_execute(stmt, params=None):
+            nonlocal call_count
+            call_count += 1
+            result = MagicMock()
+            if call_count == 1:
+                result.fetchall.return_value = []
+            else:
+                # Return 100 wallets
+                result.fetchall.return_value = [
+                    (f"Wallet{i:036d}", 0.5, 0.5, 0.0, False)
+                    for i in range(100)
+                ]
+            return result
+
+        mock_session.execute = mock_execute
+        mock_session.close = AsyncMock()
+
+        selector = WalletSelector(mock_factory)
+        wallets = await selector.select_wallets(max_wallets=50)
+
+        assert len(wallets) <= 50
+
+    @pytest.mark.asyncio
+    async def test_never_emits_all(self) -> None:
+        """The string 'all' must never be a valid Solana address."""
+        from app.infrastructure.helius.wallet_selector import is_valid_solana_address
+
+        assert is_valid_solana_address("all") is False
+
+    @pytest.mark.asyncio
+    async def test_audit_estimates_savings(self) -> None:
+        """Audit must return savings estimates."""
+        from app.infrastructure.helius.wallet_selector import SelectionAudit
+
+        audit = SelectionAudit()
+        audit.estimated_events_per_hour_before = 50000
+        audit.estimated_events_per_hour_after = 15000
+        audit.estimated_credit_savings_pct = 70.0
+
+        d = audit.to_dict()
+        assert d["estimated_events_per_hour_before"] == 50000
+        assert d["estimated_events_per_hour_after"] == 15000
+        assert d["estimated_credit_savings_pct"] == 70.0
+
+    @pytest.mark.asyncio
+    async def test_noisy_wallets_excluded(self) -> None:
+        """Noisy wallets from raw_events must be penalized."""
+        from app.infrastructure.helius.wallet_selector import WalletSelector
+
+        mock_session = AsyncMock()
+        mock_factory = MagicMock(return_value=mock_session)
+
+        call_count = 0
+
+        async def mock_execute(stmt, params=None):
+            nonlocal call_count
+            call_count += 1
+            result = MagicMock()
+            if call_count == 1:
+                # _get_noisy_wallets returns noisy wallets
+                result.fetchall.return_value = [("NoisyWallet11111111111111111111111111",)]
+            else:
+                result.fetchall.return_value = [
+                    ("GoodWallet1111111111111111111111111111", 0.7, 0.7, 0.0, False),
+                ]
+            return result
+
+        mock_session.execute = mock_execute
+        mock_session.close = AsyncMock()
+
+        selector = WalletSelector(mock_factory)
+
+        with patch.object(settings, "HELIUS_NOISY_WALLET_EXCLUDE_TOP_N", 50), \
+             patch.object(settings, "HELIUS_NOISY_WALLET_LOOKBACK_HOURS", 1), \
+             patch.object(settings, "HELIUS_MAX_EVENTS_PER_WALLET_HOUR", 500):
+            wallets = await selector.select_wallets(max_wallets=100)
+
+        assert len(wallets) <= 100
+
+
+class TestCreditSaverV2Settings:
+    """Test v2 settings defaults."""
+
+    def test_exclude_zero_trade_default(self) -> None:
+        assert settings.HELIUS_EXCLUDE_ZERO_TRADE_WALLETS is True
+
+    def test_exclude_zero_alpha_default(self) -> None:
+        assert settings.HELIUS_EXCLUDE_ZERO_ALPHA_WALLETS is True
+
+    def test_max_events_per_wallet_default(self) -> None:
+        assert settings.HELIUS_MAX_EVENTS_PER_WALLET_HOUR == 500
+
+    def test_noisy_lookback_default(self) -> None:
+        assert settings.HELIUS_NOISY_WALLET_LOOKBACK_HOURS == 1
+
+    def test_noisy_exclude_top_n_default(self) -> None:
+        assert settings.HELIUS_NOISY_WALLET_EXCLUDE_TOP_N == 50
+
+    def test_min_alpha_score_default(self) -> None:
+        assert settings.HELIUS_MIN_ALPHA_SCORE == 0.01

@@ -99,6 +99,14 @@ class Settings(BaseSettings):
     HELIUS_PROVIDER_STALE_MINUTES: int = 10
     HELIUS_MIN_ACTIVE_KEYS_ALERT: int = 3
 
+    # ── Helius Credit Saver v2 — Alpha-per-Credit ───────────
+    HELIUS_EXCLUDE_ZERO_TRADE_WALLETS: bool = True
+    HELIUS_EXCLUDE_ZERO_ALPHA_WALLETS: bool = True
+    HELIUS_MAX_EVENTS_PER_WALLET_HOUR: int = 500
+    HELIUS_NOISY_WALLET_LOOKBACK_HOURS: int = 1
+    HELIUS_NOISY_WALLET_EXCLUDE_TOP_N: int = 50
+    HELIUS_MIN_ALPHA_SCORE: float = 0.01
+
     # ── Admin Auth ──────────────────────────────────────────
     ADMIN_API_TOKEN: str = ""
 

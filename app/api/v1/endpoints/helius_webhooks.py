@@ -406,3 +406,41 @@ async def refresh_wallets(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail="Failed to refresh wallet list",
     )
+
+
+# ── Wallet Selection Audit ──────────────────────────────────
+
+
+class WalletAuditResponse(BaseModel):
+    total_wallets_in_pool: int
+    selected_wallet_count: int
+    excluded_zero_trade_count: int
+    excluded_zero_alpha_count: int
+    excluded_noisy_count: int
+    excluded_low_score_count: int
+    estimated_events_per_hour_before: int
+    estimated_events_per_hour_after: int
+    estimated_credit_savings_pct: float
+    top_excluded_wallets: list[str] = []
+
+
+@router.get(
+    "/webhooks/wallet-audit",
+    response_model=WalletAuditResponse,
+    summary="Wallet selection audit (admin only)",
+)
+async def wallet_audit(
+    request: Request,
+    token: str = Depends(_verify_admin_token),
+) -> WalletAuditResponse:
+    """Audit wallet selection: compare before/after exclusion counts and event rates."""
+    _check_rate_limit(request)
+    from app.infrastructure.helius.wallet_selector import WalletSelector
+    from app.infrastructure.database.session import async_session_factory
+
+    selector = WalletSelector(async_session_factory)
+    audit = await selector.audit_selection()
+
+    _audit_log("wallet-audit")
+
+    return WalletAuditResponse(**audit.to_dict())
