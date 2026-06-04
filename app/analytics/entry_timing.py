@@ -137,10 +137,10 @@ class EntryTimingAnalyzer:
         if snapshots:
             local_low = min(s.price for s in snapshots)
 
-        # Distance from local low
+        # Distance from local low (decimal ratio: 0.25 = 25%)
         distance_from_low = None
         if local_low is not None and local_low > 0 and entry_price is not None:
-            distance_from_low = ((entry_price - local_low) / local_low) * 100
+            distance_from_low = (entry_price - local_low) / local_low
 
         # Price changes
         change_15m = self._compute_change(price_15m, entry_price)
@@ -196,9 +196,9 @@ class EntryTimingAnalyzer:
         earlier_price: float | None,
         later_price: float | None,
     ) -> float | None:
-        """Compute percentage change from earlier to later price."""
+        """Compute price change as decimal ratio (0.25 = 25%)."""
         if earlier_price is None or later_price is None:
             return None
         if earlier_price <= 0:
             return None
-        return round(((later_price - earlier_price) / earlier_price) * 100, 4)
+        return round((later_price - earlier_price) / earlier_price, 4)

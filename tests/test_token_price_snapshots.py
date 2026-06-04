@@ -434,10 +434,10 @@ class TestEntryTimingAnalyzer:
         )
 
         # local_low = 0.8, entry = 1.0
-        # distance = (1.0 - 0.8) / 0.8 * 100 = 25%
+        # distance = (1.0 - 0.8) / 0.8 = 0.25 (25%)
         assert metrics.local_low_60m == 0.8
         assert metrics.entry_distance_from_local_low_pct is not None
-        assert abs(metrics.entry_distance_from_local_low_pct - 25.0) < 0.01
+        assert abs(metrics.entry_distance_from_local_low_pct - 0.25) < 0.001
 
     @pytest.mark.asyncio
     async def test_price_change_computation(self) -> None:
@@ -471,9 +471,9 @@ class TestEntryTimingAnalyzer:
             entry_price=1.1,
         )
 
-        # price_15m = 1.0, entry = 1.1 => 10% change
+        # price_15m = 1.0, entry = 1.1 => 0.10 (10% change)
         assert metrics.price_change_15m_pct is not None
-        assert abs(metrics.price_change_15m_pct - 10.0) < 0.01
+        assert abs(metrics.price_change_15m_pct - 0.10) < 0.001
 
     @pytest.mark.asyncio
     async def test_metrics_to_dict(self) -> None:
@@ -490,10 +490,10 @@ class TestEntryTimingAnalyzer:
             price_30m_before=0.85,
             price_60m_before=0.80,
             local_low_60m=0.80,
-            entry_distance_from_local_low_pct=25.0,
-            price_change_15m_pct=11.11,
-            price_change_30m_pct=17.65,
-            price_change_60m_pct=25.0,
+            entry_distance_from_local_low_pct=0.25,
+            price_change_15m_pct=0.1111,
+            price_change_30m_pct=0.1765,
+            price_change_60m_pct=0.25,
             data_quality="sufficient_history",
         )
 
@@ -520,12 +520,12 @@ class TestEntryTimingAnalyzer:
         assert EntryTimingAnalyzer._compute_change(0, 1.0) is None
 
     def test_change_computation_normal(self) -> None:
-        """Change should compute percentage correctly."""
+        """Change should compute decimal ratio correctly (0.10 = 10%)."""
         from app.analytics.entry_timing import EntryTimingAnalyzer
 
         result = EntryTimingAnalyzer._compute_change(1.0, 1.1)
         assert result is not None
-        assert abs(result - 10.0) < 0.01
+        assert abs(result - 0.10) < 0.001
 
 
 # ── Worker Integration Tests ────────────────────────────────

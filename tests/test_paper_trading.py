@@ -311,10 +311,10 @@ class TestEntryTimingIntegration:
             price_30m_before=1.05,
             price_60m_before=1.0,
             local_low_60m=1.0,
-            entry_distance_from_local_low_pct=30.0,
-            price_change_15m_pct=18.18,
-            price_change_30m_pct=23.81,
-            price_change_60m_pct=30.0,
+            entry_distance_from_local_low_pct=0.30,
+            price_change_15m_pct=0.1818,
+            price_change_30m_pct=0.2381,
+            price_change_60m_pct=0.30,
             data_quality="sufficient_history",
         )
 
@@ -352,10 +352,10 @@ class TestEntryTimingIntegration:
             price_30m_before=0.82,
             price_60m_before=0.80,
             local_low_60m=0.80,
-            entry_distance_from_local_low_pct=0.20,
-            price_change_15m_pct=25.0,
-            price_change_30m_pct=28.05,
-            price_change_60m_pct=31.25,
+            entry_distance_from_local_low_pct=0.0020,
+            price_change_15m_pct=0.25,
+            price_change_30m_pct=0.2805,
+            price_change_60m_pct=0.3125,
             data_quality="sufficient_history",
         )
 
@@ -364,7 +364,7 @@ class TestEntryTimingIntegration:
         mock_session_factory.return_value = mock_session
 
         with patch.object(settings, "PAPER_ENTRY_TIMING_ENABLED", True), \
-             patch.object(settings, "PAPER_LATE_ENTRY_MAX_DISTANCE_FROM_LOW_PCT", 25.0), \
+             patch.object(settings, "PAPER_LATE_ENTRY_MAX_DISTANCE_FROM_LOW_PCT", 0.25), \
              patch.object(settings, "PAPER_CHASING_PUMP_WAIT_CHANGE_15M_PCT", 0.20):
 
             with patch("app.analytics.entry_timing.EntryTimingAnalyzer") as MockAnalyzer:
@@ -394,10 +394,10 @@ class TestEntryTimingIntegration:
             price_30m_before=0.80,
             price_60m_before=0.78,
             local_low_60m=0.78,
-            entry_distance_from_local_low_pct=0.20,
-            price_change_15m_pct=4.76,
-            price_change_30m_pct=37.5,
-            price_change_60m_pct=41.03,
+            entry_distance_from_local_low_pct=0.0020,
+            price_change_15m_pct=0.0476,
+            price_change_30m_pct=0.375,
+            price_change_60m_pct=0.4103,
             data_quality="sufficient_history",
         )
 
@@ -406,8 +406,8 @@ class TestEntryTimingIntegration:
         mock_session_factory.return_value = mock_session
 
         with patch.object(settings, "PAPER_ENTRY_TIMING_ENABLED", True), \
-             patch.object(settings, "PAPER_LATE_ENTRY_MAX_DISTANCE_FROM_LOW_PCT", 25.0), \
-             patch.object(settings, "PAPER_CHASING_PUMP_WAIT_CHANGE_15M_PCT", 20.0), \
+             patch.object(settings, "PAPER_LATE_ENTRY_MAX_DISTANCE_FROM_LOW_PCT", 0.25), \
+             patch.object(settings, "PAPER_CHASING_PUMP_WAIT_CHANGE_15M_PCT", 0.20), \
              patch.object(settings, "PAPER_CHASING_PUMP_WAIT_CHANGE_30M_PCT", 0.30):
 
             with patch("app.analytics.entry_timing.EntryTimingAnalyzer") as MockAnalyzer:
@@ -437,10 +437,10 @@ class TestEntryTimingIntegration:
             price_30m_before=0.97,
             price_60m_before=0.96,
             local_low_60m=0.95,
-            entry_distance_from_local_low_pct=5.26,
-            price_change_15m_pct=2.04,
-            price_change_30m_pct=3.09,
-            price_change_60m_pct=4.17,
+            entry_distance_from_local_low_pct=0.0526,
+            price_change_15m_pct=0.0204,
+            price_change_30m_pct=0.0309,
+            price_change_60m_pct=0.0417,
             data_quality="sufficient_history",
         )
 
@@ -449,9 +449,9 @@ class TestEntryTimingIntegration:
         mock_session_factory.return_value = mock_session
 
         with patch.object(settings, "PAPER_ENTRY_TIMING_ENABLED", True), \
-             patch.object(settings, "PAPER_LATE_ENTRY_MAX_DISTANCE_FROM_LOW_PCT", 25.0), \
-             patch.object(settings, "PAPER_CHASING_PUMP_WAIT_CHANGE_15M_PCT", 20.0), \
-             patch.object(settings, "PAPER_CHASING_PUMP_WAIT_CHANGE_30M_PCT", 30.0):
+             patch.object(settings, "PAPER_LATE_ENTRY_MAX_DISTANCE_FROM_LOW_PCT", 0.25), \
+             patch.object(settings, "PAPER_CHASING_PUMP_WAIT_CHANGE_15M_PCT", 0.20), \
+             patch.object(settings, "PAPER_CHASING_PUMP_WAIT_CHANGE_30M_PCT", 0.30):
 
             with patch("app.analytics.entry_timing.EntryTimingAnalyzer") as MockAnalyzer:
                 instance = MockAnalyzer.return_value
@@ -464,7 +464,7 @@ class TestEntryTimingIntegration:
         assert result["metrics"] is not None
         assert result["metrics"]["entry_price"] == 1.0
         assert result["metrics"]["local_low_60m"] == 0.95
-        assert result["metrics"]["price_change_15m_pct"] == 2.04
+        assert result["metrics"]["price_change_15m_pct"] == 0.0204
         assert result["metrics"]["data_quality"] == "sufficient_history"
 
     @pytest.mark.asyncio
