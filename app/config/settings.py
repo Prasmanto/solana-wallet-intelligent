@@ -92,6 +92,13 @@ class Settings(BaseSettings):
     HELIUS_FAILOVER_MULTI_WEBHOOK_MODE: bool = False
     HELIUS_FAILOVER_HEALTH_CHECK_INTERVAL: int = 300  # seconds
 
+    # ── Helius Credit Saver ─────────────────────────────────
+    HELIUS_CREDIT_SAVER_ENABLED: bool = True
+    HELIUS_MAX_MONITORED_WALLETS: int = 3000
+    HELIUS_WALLET_REFRESH_HOURS: int = 24
+    HELIUS_PROVIDER_STALE_MINUTES: int = 10
+    HELIUS_MIN_ACTIVE_KEYS_ALERT: int = 3
+
     # ── Admin Auth ──────────────────────────────────────────
     ADMIN_API_TOKEN: str = ""
 

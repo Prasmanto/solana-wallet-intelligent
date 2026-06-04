@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from app.infrastructure.helius.helius_client import HeliusApiError
 from app.infrastructure.helius.webhook_failover import get_webhook_failover
 from app.infrastructure.helius.webhook_manager import get_webhook_manager
+from app.config.settings import settings
 
 logger = structlog.get_logger(__name__)
 
@@ -300,4 +301,108 @@ async def reset_provider_health(
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail=f"Provider {provider_name} not found",
+    )
+
+
+# ── Credit Saver Endpoints ──────────────────────────────────
+
+
+class ProviderHealthResponse(BaseModel):
+    provider_status: str
+    active_key_count: int
+    exhausted_key_count: int
+    failed_key_count: int
+    total_key_count: int
+    monitored_wallet_count: int
+    last_raw_event_age_seconds: float | None
+    data_freshness: str
+    estimated_events_per_hour: int
+    estimated_credits_per_day: int
+    estimated_time_to_exhaustion_hours: float | str
+    credit_saver_enabled: bool
+    max_monitored_wallets: int
+    wallet_refresh_hours: int
+    alerts: list[str] = []
+
+
+class WalletRefreshResponse(BaseModel):
+    status: str
+    wallets_refreshed: int
+    max_wallets: int
+    message: str
+
+
+@router.get(
+    "/webhooks/provider-health",
+    response_model=ProviderHealthResponse,
+    summary="Provider health and credit saver status (admin only)",
+)
+async def get_provider_health(
+    request: Request,
+    token: str = Depends(_verify_admin_token),
+) -> ProviderHealthResponse:
+    """Get comprehensive provider health including credit saver metrics."""
+    _check_rate_limit(request)
+    manager = get_webhook_manager()
+    manager.reload()
+    failover = get_webhook_failover()
+
+    # Get raw event count from DB
+    raw_events_5m = 0
+    try:
+        from app.infrastructure.database.session import async_session_factory
+        from sqlalchemy import text
+
+        session = async_session_factory()
+        try:
+            result = await session.execute(
+                text("SELECT count(*) FROM raw_events WHERE created_at >= now() - interval '5 minutes'")
+            )
+            raw_events_5m = result.scalar() or 0
+        finally:
+            await session.close()
+    except Exception:
+        pass
+
+    health = failover.get_provider_health(raw_events_5m=raw_events_5m)
+    alerts = failover.check_alerts(raw_events_5m=raw_events_5m)
+
+    _audit_log("provider-health-check")
+
+    return ProviderHealthResponse(**health, alerts=alerts)
+
+
+@router.post(
+    "/webhooks/refresh-wallets",
+    response_model=WalletRefreshResponse,
+    summary="Refresh monitored wallet list (admin only)",
+)
+async def refresh_wallets(
+    request: Request,
+    token: str = Depends(_verify_admin_token),
+) -> WalletRefreshResponse:
+    """Refresh the monitored wallet list and update the active webhook."""
+    _check_rate_limit(request)
+    failover = get_webhook_failover()
+
+    count = await failover.refresh_wallet_list()
+
+    if count > 0:
+        # Update the active webhook with new wallet list
+        updated = await failover.update_webhook_wallets()
+        _audit_log(
+            "refresh-wallets",
+            details={"wallet_count": count, "webhook_updated": updated},
+        )
+        return WalletRefreshResponse(
+            status="ok",
+            wallets_refreshed=count,
+            max_wallets=settings.HELIUS_MAX_MONITORED_WALLETS,
+            message=f"Refreshed {count} wallets" + (", webhook updated" if updated else ""),
+        )
+
+    _audit_log("refresh-wallets-failed")
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="Failed to refresh wallet list",
     )

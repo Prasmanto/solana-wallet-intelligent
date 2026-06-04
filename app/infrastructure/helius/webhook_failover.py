@@ -3,16 +3,21 @@
 Detects stale webhooks (no events for N minutes) and creates
 a new webhook on the next available Helius account.
 
+Credit Saver Mode: selects top-N wallets by quality to reduce
+Helius credit consumption while preserving alpha signal quality.
+
 No ingestion pipeline logic is modified.
 """
 
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import structlog
 
+from app.config.settings import settings
 from app.infrastructure.helius.helius_client import HeliusApiError, HeliusWebhookClient
 from app.infrastructure.helius.webhook_manager import WebhookManager, get_webhook_manager
 from app.infrastructure.helius.webhook_models import (
@@ -30,9 +35,14 @@ class WebhookFailover:
     Lifecycle:
     1. Check if current webhook is healthy (received events recently)
     2. If stale/exhausted, find next available provider
-    3. Create webhook on new provider
+    3. Create webhook on new provider with selected wallet addresses
     4. Update manager state
     5. Log failover event
+
+    Credit Saver Mode:
+    - Selects top-N wallets from wallet_metrics by quality signals
+    - Updates existing webhook accountAddresses without recreating
+    - Refreshes wallet list on configurable interval
     """
 
     def __init__(
@@ -43,6 +53,10 @@ class WebhookFailover:
         self._manager = manager or get_webhook_manager()
         self._client = client or HeliusWebhookClient()
         self._failover_history: list[FailoverTrigger] = []
+        self._monitored_wallets: list[str] = []
+        self._wallets_last_refresh: datetime | None = None
+        self._events_at_last_check: int = 0
+        self._events_per_hour: float = 0.0
 
     @property
     def manager(self) -> WebhookManager:
@@ -129,9 +143,11 @@ class WebhookFailover:
 
         # Create webhook on next provider
         try:
+            wallet_addrs = await self.get_monitored_wallets()
             webhook_info = await self._client.create_webhook(
                 api_key=next_key,
                 webhook_url=self._manager.config.webhook_url,
+                account_addresses=wallet_addrs if wallet_addrs else None,
             )
             new_webhook_id = webhook_info.get("webhookID", "")
 
@@ -220,9 +236,11 @@ class WebhookFailover:
             return existing_webhook_id
 
         try:
+            wallet_addrs = await self.get_monitored_wallets()
             webhook_info = await self._client.create_webhook(
                 api_key=key,
                 webhook_url=self._manager.config.webhook_url,
+                account_addresses=wallet_addrs if wallet_addrs else None,
             )
             new_webhook_id = webhook_info.get("webhookID", "")
 
@@ -272,6 +290,206 @@ class WebhookFailover:
             }
             for t in self._failover_history[-20:]
         ]
+
+    # ── Credit Saver: Wallet Management ─────────────────────
+
+    async def get_monitored_wallets(self) -> list[str]:
+        """Get current monitored wallet list, refreshing if stale."""
+        if not settings.HELIUS_CREDIT_SAVER_ENABLED:
+            return self._monitored_wallets
+
+        now = datetime.now(timezone.utc)
+        stale = False
+        if self._wallets_last_refresh is None:
+            stale = True
+        else:
+            age_hours = (now - self._wallets_last_refresh).total_seconds() / 3600
+            if age_hours >= settings.HELIUS_WALLET_REFRESH_HOURS:
+                stale = True
+
+        if stale or not self._monitored_wallets:
+            await self.refresh_wallet_list()
+
+        return self._monitored_wallets
+
+    async def refresh_wallet_list(self) -> int:
+        """Refresh the monitored wallet list from wallet_metrics.
+
+        Returns number of wallets selected.
+        """
+        from app.infrastructure.helius.wallet_selector import WalletSelector
+        from app.infrastructure.database.session import async_session_factory
+
+        try:
+            selector = WalletSelector(async_session_factory)
+            wallets = await selector.select_wallets(
+                max_wallets=settings.HELIUS_MAX_MONITORED_WALLETS,
+            )
+            if wallets:
+                self._monitored_wallets = wallets
+                self._wallets_last_refresh = datetime.now(timezone.utc)
+                logger.info(
+                    "credit_saver.wallets_refreshed",
+                    count=len(wallets),
+                    max=settings.HELIUS_MAX_MONITORED_WALLETS,
+                )
+            else:
+                logger.warning("credit_saver.wallet_refresh_empty")
+            return len(wallets)
+        except Exception as e:
+            logger.error("credit_saver.wallet_refresh_error", error=str(e)[:200])
+            return 0
+
+    async def update_webhook_wallets(self) -> bool:
+        """Update the active webhook's accountAddresses without recreating.
+
+        Returns True if update succeeded.
+        """
+        provider = self._manager.get_provider_with_webhook()
+        if not provider:
+            logger.warning("credit_saver.no_webhook_to_update")
+            return False
+
+        api_key = provider.get("key", "")
+        webhook_id = provider.get("webhook_id", "")
+        if not api_key or not webhook_id:
+            return False
+
+        wallets = await self.get_monitored_wallets()
+        if not wallets:
+            logger.warning("credit_saver.no_wallets_for_update")
+            return False
+
+        try:
+            await self._client.update_webhook(
+                api_key=api_key,
+                webhook_id=webhook_id,
+                account_addresses=wallets,
+            )
+            logger.info(
+                "credit_saver.webhook_wallets_updated",
+                webhook_id=webhook_id,
+                wallet_count=len(wallets),
+            )
+            return True
+        except HeliusApiError as e:
+            if e.status_code == 402:
+                self._manager.mark_provider_exhausted(
+                    provider.get("name", "unknown"),
+                    reason="credit_exhausted",
+                )
+            logger.error(
+                "credit_saver.update_webhook_failed",
+                error=str(e)[:200],
+                status_code=e.status_code,
+            )
+            return False
+
+    # ── Provider Health ─────────────────────────────────────
+
+    def get_provider_health(self, raw_events_5m: int = 0) -> dict[str, Any]:
+        """Get comprehensive provider health summary.
+
+        Args:
+            raw_events_5m: raw event count in last 5 minutes (from DB)
+        """
+        status = self._manager.get_status()
+        providers = status.get("providers", [])
+
+        active_count = sum(
+            1 for p in providers
+            if p.get("active") and not p.get("exhausted")
+        )
+        exhausted_count = sum(
+            1 for p in providers
+            if p.get("exhausted")
+        )
+        failed_count = sum(
+            1 for p in providers
+            if p.get("consecutive_errors", 0) >= 3
+        )
+
+        # Estimate events per hour from 5m count
+        events_per_hour = raw_events_5m * 12.0 if raw_events_5m > 0 else 0.0
+
+        # Estimate credits per day (1 credit ≈ 1 event for enhanced webhooks)
+        credits_per_day = events_per_hour * 24.0
+
+        # Estimate time to exhaustion
+        # Each key has ~100K credits/day on free tier
+        remaining_keys = max(active_count, 1)
+        daily_capacity = remaining_keys * 100_000
+        time_to_exhaust_hours = (
+            daily_capacity / credits_per_day * 24
+            if credits_per_day > 0
+            else float("inf")
+        )
+
+        # Data freshness
+        last_event_age = status.get("last_event_age_seconds")
+        stale_minutes = settings.HELIUS_PROVIDER_STALE_MINUTES
+        is_stale = (
+            last_event_age is not None
+            and last_event_age > stale_minutes * 60
+        )
+
+        return {
+            "provider_status": "STALE" if is_stale else status.get("health", "unknown"),
+            "active_key_count": active_count,
+            "exhausted_key_count": exhausted_count,
+            "failed_key_count": failed_count,
+            "total_key_count": len(providers),
+            "monitored_wallet_count": len(self._monitored_wallets),
+            "last_raw_event_age_seconds": last_event_age,
+            "data_freshness": "STALE" if is_stale else "FRESH",
+            "estimated_events_per_hour": round(events_per_hour),
+            "estimated_credits_per_day": round(credits_per_day),
+            "estimated_time_to_exhaustion_hours": (
+                round(time_to_exhaust_hours, 1)
+                if time_to_exhaust_hours < 10000
+                else "unlimited"
+            ),
+            "credit_saver_enabled": settings.HELIUS_CREDIT_SAVER_ENABLED,
+            "max_monitored_wallets": settings.HELIUS_MAX_MONITORED_WALLETS,
+            "wallet_refresh_hours": settings.HELIUS_WALLET_REFRESH_HOURS,
+        }
+
+    def check_alerts(self, raw_events_5m: int = 0) -> list[str]:
+        """Check for alert conditions and return warning messages."""
+        alerts = []
+        status = self._manager.get_status()
+        providers = status.get("providers", [])
+
+        active_count = sum(
+            1 for p in providers
+            if p.get("active") and not p.get("exhausted")
+        )
+
+        # Alert: active keys below threshold
+        if active_count < settings.HELIUS_MIN_ACTIVE_KEYS_ALERT:
+            alerts.append(
+                f"LOW_ACTIVE_KEYS: {active_count} active keys "
+                f"(threshold: {settings.HELIUS_MIN_ACTIVE_KEYS_ALERT})"
+            )
+
+        # Alert: stale data
+        last_event_age = status.get("last_event_age_seconds")
+        stale_threshold = settings.HELIUS_PROVIDER_STALE_MINUTES * 60
+        if last_event_age is not None and last_event_age > stale_threshold:
+            alerts.append(
+                f"STALE_DATA: no events for {round(last_event_age/60)}m "
+                f"(threshold: {settings.HELIUS_PROVIDER_STALE_MINUTES}m)"
+            )
+
+        # Alert: max usage reached on active key
+        active_provider = self._manager.get_active_provider()
+        if active_provider and active_provider.get("error_reason") == "credit_exhausted_helius":
+            alerts.append("MAX_USAGE_REACHED: active provider credit exhausted")
+
+        for alert in alerts:
+            logger.warning("helius_alert", message=alert)
+
+        return alerts
 
     async def cleanup(self) -> None:
         """Close HTTP client."""
