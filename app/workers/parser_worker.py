@@ -118,6 +118,10 @@ class ParserWorker(ConsumerWorker):
         amount = enriched.get("amount", 0) or enriched.get("amount_out", 0) or enriched.get("amount_in", 0)
         signature = enriched.get("signature", "")
 
+        # Extract both legs of the swap for PnL calculation
+        amount_in = enriched.get("amount_in", 0) or 0
+        amount_out = enriched.get("amount_out", 0) or 0
+
         # Skip if no wallet (token can be "unknown")
         if not wallet or len(wallet) < 30:
             logger.debug(
@@ -212,14 +216,25 @@ class ParserWorker(ConsumerWorker):
                 pos_size = float(position.position_size)
                 avg_cost = float(position.avg_cost_basis)
 
+                # Compute cost per token: SOL spent / tokens received
+                # amount_in = SOL spent, amount_out = tokens received
+                cost_per_token = 0.0
+                if amount_out > 0 and amount_in > 0:
+                    cost_per_token = amount_in / amount_out
+                elif amount > 0 and amount_in > 0:
+                    cost_per_token = amount_in / amount
+
                 if pos_size == 0:
-                    position.avg_cost_basis = 1.0
+                    position.avg_cost_basis = cost_per_token if cost_per_token > 0 else 0
                 else:
+                    # Weighted average: (old_qty * old_cost + new_qty * new_cost) / total_qty
+                    new_cost = amount * cost_per_token if cost_per_token > 0 else 0
                     position.avg_cost_basis = (
-                        (pos_size * avg_cost) + amount
+                        (pos_size * avg_cost) + new_cost
                     ) / (pos_size + amount) if (pos_size + amount) else 0
 
                 position.position_size = pos_size + amount
+                position.total_cost_basis = float(position.total_cost_basis) + (amount * cost_per_token if cost_per_token > 0 else 0)
                 position.total_buys = int(position.total_buys) + 1
                 position.total_buy_volume = float(position.total_buy_volume) + amount
                 position.first_buy_at = position.first_buy_at or now
@@ -229,8 +244,18 @@ class ParserWorker(ConsumerWorker):
                 pos_size = float(position.position_size)
                 if pos_size > 0:
                     avg_cost = float(position.avg_cost_basis)
-                    sell_proceeds = amount * avg_cost
-                    position.realized_pnl = float(position.realized_pnl) + sell_proceeds - (amount * avg_cost)
+
+                    # Compute sell price per token: SOL received / tokens sold
+                    # amount_in = tokens sold, amount_out = SOL received
+                    sell_price_per_token = 0.0
+                    if amount_in > 0 and amount_out > 0:
+                        sell_price_per_token = amount_out / amount_in
+                    elif amount > 0 and amount_out > 0:
+                        sell_price_per_token = amount_out / amount
+
+                    # Realized PnL = (sell_price - cost_basis) * tokens_sold
+                    realized = (sell_price_per_token - avg_cost) * amount
+                    position.realized_pnl = float(position.realized_pnl) + realized
                     position.position_size = max(pos_size - amount, 0)
                     position.total_sells = int(position.total_sells) + 1
                     position.total_sell_volume = float(position.total_sell_volume) + amount

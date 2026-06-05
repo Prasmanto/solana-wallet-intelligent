@@ -144,61 +144,15 @@ class PaperTradingWorker:
         """Process a single paper trading candidate.
 
         Called by the stream consumer or directly by RankingWorker.
+
+        Runs the FULL filter chain regardless of DRY_RUN mode.
+        Only records dry_run_mode if candidate passes ALL filters.
         """
         token = candidate.get("token", "")
         score = candidate.get("score", 0)
         rank = candidate.get("rank", 0)
 
         if not token:
-            return
-
-        # Guard: dry-run mode — record SKIPPED, never create OPEN position
-        # Still runs entry timing analysis for audit visibility
-        if not settings.PAPER_TRADING_ENABLED or settings.PAPER_TRADING_DRY_RUN:
-            entry_price = await self._fetch_price(token)
-            timing_result: dict[str, Any] = {"passed": True, "skip_reason": "", "metrics": None, "warnings": []}
-            if entry_price and entry_price > 0:
-                timing_result = await self._check_entry_timing(token, entry_price)
-            skip_reason = timing_result["skip_reason"] if not timing_result["passed"] else "dry_run_mode"
-            timing_data = {"entry_timing": timing_result["metrics"], "warnings": timing_result["warnings"]} if timing_result["metrics"] else None
-            await self._persist_skipped(
-                token=token,
-                score=score,
-                rank=rank,
-                reason=skip_reason,
-                candidate=candidate,
-                activity_data=timing_data,
-            )
-            logger.info(
-                "paper.candidate_dry_run",
-                token=token[:16],
-                score=score,
-                rank=rank,
-                skip_reason=skip_reason,
-            )
-            return
-
-        # Guard: max open positions
-        open_count = await self._count_open_positions()
-        if open_count >= settings.PAPER_MAX_POSITIONS:
-            await self._persist_skipped(
-                token=token,
-                score=score,
-                rank=rank,
-                reason="max_positions_reached",
-                candidate=candidate,
-            )
-            return
-
-        # Guard: already have open position for this token
-        if await self._has_open_position(token):
-            await self._persist_skipped(
-                token=token,
-                score=score,
-                rank=rank,
-                reason="duplicate_token",
-                candidate=candidate,
-            )
             return
 
         # Guard: token activity filter
@@ -291,6 +245,41 @@ class PaperTradingWorker:
 
         # Capture price snapshot for candidate (non-fatal, best-effort)
         await self._capture_candidate_snapshot(token, candidate)
+
+        # ── All filters passed ──
+        # If DRY_RUN, record dry_run_mode (candidate WOULD open if DRY_RUN=false)
+        # If not DRY_RUN, open the position
+        if not settings.PAPER_TRADING_ENABLED or settings.PAPER_TRADING_DRY_RUN:
+            # Build full metadata for audit
+            timing_data = None
+            if timing_result.get("metrics"):
+                timing_data = {
+                    "entry_timing": timing_result["metrics"],
+                    "warnings": timing_result.get("warnings", []),
+                }
+            # Include token activity metrics for observability
+            token_activity = candidate.get("token_activity_metrics", {})
+            if token_activity:
+                if timing_data is None:
+                    timing_data = {}
+                timing_data["token_activity_metrics"] = token_activity
+            await self._persist_skipped(
+                token=token,
+                score=score,
+                rank=rank,
+                reason="dry_run_mode",
+                candidate=candidate,
+                activity_data=timing_data,
+            )
+            logger.info(
+                "paper.candidate_dry_run",
+                token=token[:16],
+                score=score,
+                rank=rank,
+                smart_money=smart_money,
+                momentum=momentum,
+            )
+            return
 
         # Create OPEN position in DB
         await self._persist_open_position(

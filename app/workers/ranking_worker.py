@@ -586,6 +586,41 @@ class RankingWorker(ConsumerWorker):
             await session.close()
 
 
+async def _get_token_activity_metrics(session, token_mint: str) -> dict[str, Any]:
+    """Get token-level activity metrics from wallet_positions.
+
+    Returns aggregated buy/sell counts, volumes, and unique wallets for a token.
+    These metrics are for observability/logging only — not used for filtering.
+    """
+    try:
+        stmt = text("""
+            SELECT
+                count(DISTINCT wallet) AS unique_wallets,
+                coalesce(sum(total_buys), 0) AS buy_count,
+                coalesce(sum(total_sells), 0) AS sell_count,
+                coalesce(sum(total_buy_volume), 0) AS buy_volume,
+                coalesce(sum(total_sell_volume), 0) AS sell_volume
+            FROM wallet_positions
+            WHERE token_mint = :token
+        """)
+        result = await session.execute(stmt, {"token": token_mint})
+        row = result.fetchone()
+        if not row:
+            return {}
+        buy_count = int(row[1])
+        sell_count = int(row[2])
+        return {
+            "token_unique_wallets_total": int(row[0]),
+            "token_buy_count_total": buy_count,
+            "token_sell_count_total": sell_count,
+            "token_buy_sell_ratio_total": round(buy_count / sell_count, 2) if sell_count > 0 else float("inf") if buy_count > 0 else 0,
+            "token_buy_volume_total": float(row[3]),
+            "token_sell_volume_total": float(row[4]),
+        }
+    except Exception:
+        return {}
+
+
 async def get_paper_trading_candidates(
     session_factory,
     min_score: float | None = None,
@@ -670,6 +705,7 @@ async def get_paper_trading_candidates(
                 "signals": row[7] if row[7] else {},
                 "created_at": row[8].isoformat() if row[8] else "",
                 "ranking_window": row[9] or "",
+                "token_activity_metrics": await _get_token_activity_metrics(session, token),
             })
 
             if len(candidates) >= max_candidates:

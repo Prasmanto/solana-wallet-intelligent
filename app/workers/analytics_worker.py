@@ -166,9 +166,19 @@ class AnalyticsWorker(ConsumerWorker):
 
         if wallet:
             try:
-                from app.intelligence.features import PersistentFeatureStore
-                features = PersistentFeatureStore()
-                wallet_features = features.extract(wallet, [payload])
+                # Compute features directly from the payload
+                event_type = payload.get("event_type", "TRANSFER")
+                amount = payload.get("amount", 0) or payload.get("amount_out", 0) or payload.get("amount_in", 0)
+                wallet_features = {
+                    "volume": float(amount),
+                    "tx_frequency": 1,
+                    "buy_count": 1 if event_type == "BUY" else 0,
+                    "sell_count": 1 if event_type == "SELL" else 0,
+                    "transfer_count": 1 if event_type == "TRANSFER" else 0,
+                    "buy_sell_ratio": 1.0 if event_type == "BUY" else 0.0 if event_type == "SELL" else 0.0,
+                    "token_diversity": 1,
+                    "interaction_score": 0.5,
+                }
             except Exception:
                 pass
 
